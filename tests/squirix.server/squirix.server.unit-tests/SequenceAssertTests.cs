@@ -1,8 +1,10 @@
 using System;
+using System.Threading;
 using System.Threading.Tasks;
 using Squirix.Server.Attributes;
 using Squirix.Server.TestKit;
 using Squirix.Server.UnitTests.Support;
+using TUnit.Assertions.Exceptions;
 using TUnit.Core;
 
 namespace Squirix.Server.UnitTests;
@@ -12,28 +14,31 @@ namespace Squirix.Server.UnitTests;
 public sealed class SequenceAssertTests : ServerUnitTestBase
 {
     /// <summary>A differing element fails the assertion.</summary>
+    /// <param name="cancellationToken">The test cancellation token.</param>
     [Test]
-    public async Task SpanOverloadFailsOnElementMismatch()
+    public async Task SpanOverloadFailsOnElementMismatch(CancellationToken cancellationToken)
     {
         var actual = new[] { 1, 2, 4 };
-        _ = await NodeAsyncAssert.ThrowsAnyAsync<Exception>(SequenceAssert.EqualAsync([1, 2, 3], actual));
+        _ = await NodeAsyncAssert.ThrowsAsync<AssertionException>(SequenceAssert.EqualAsync([1, 2, 3], actual), TimeSpan.FromSeconds(30), TimeProvider.System, cancellationToken);
     }
 
     /// <summary>A different length fails the assertion.</summary>
+    /// <param name="cancellationToken">The test cancellation token.</param>
     [Test]
-    public async Task SpanOverloadFailsOnLengthMismatch()
+    public async Task SpanOverloadFailsOnLengthMismatch(CancellationToken cancellationToken)
     {
         var actual = new[] { 1, 2 };
-        _ = await NodeAsyncAssert.ThrowsAnyAsync<Exception>(SequenceAssert.EqualAsync([1, 2, 3], actual));
+        _ = await NodeAsyncAssert.ThrowsAsync<AssertionException>(SequenceAssert.EqualAsync([1, 2, 3], actual), TimeSpan.FromSeconds(30), TimeProvider.System, cancellationToken);
     }
 
     /// <summary>The comparer overload honors the supplied comparer for both matches and mismatches.</summary>
+    /// <param name="cancellationToken">The test cancellation token.</param>
     [Test]
-    public async Task SpanOverloadUsesSuppliedComparer()
+    public async Task SpanOverloadUsesSuppliedComparer(CancellationToken cancellationToken)
     {
         var actual = new[] { "A", "b" };
         await SequenceAssert.EqualAsync<string>(["a", "B"], actual, StringComparer.OrdinalIgnoreCase);
-        _ = await NodeAsyncAssert.ThrowsAnyAsync<Exception>(SequenceAssert.EqualAsync<string>(["a", "B"], actual, StringComparer.Ordinal));
+        _ = await NodeAsyncAssert.ThrowsAsync<AssertionException>(SequenceAssert.EqualAsync<string>(["a", "B"], actual, StringComparer.Ordinal), TimeSpan.FromSeconds(30), TimeProvider.System, cancellationToken);
     }
 
     /// <summary>Equal literal and actual items pass.</summary>

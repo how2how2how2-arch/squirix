@@ -34,6 +34,13 @@ internal sealed class FingerprintWriter
 
     internal void AppendFlag(bool value) => Append(value ? '1' : '0');
 
+    internal void Append(ReadOnlySpan<char> value)
+    {
+        EnsureCapacity(value.Length);
+        value.CopyTo(_buffer.AsSpan(_length));
+        _length += value.Length;
+    }
+
     internal ReadOnlySpan<char> AsSpan() => new(_buffer, 0, _length);
 
     internal void Clear() => _length = 0;

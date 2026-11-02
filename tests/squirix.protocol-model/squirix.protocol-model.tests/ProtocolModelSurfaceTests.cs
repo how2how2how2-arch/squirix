@@ -159,6 +159,40 @@ public sealed class ProtocolModelSurfaceTests
         _ = await Assert.That(SafetyChecker.Check(state)).IsNull();
     }
 
+    /// <summary>Verifies a clean run into a reused output directory leaves no policy report behind from the previous run.</summary>
+    /// <param name="cancellationToken">The test cancellation token.</param>
+    /// <remarks>
+    /// The report's name carries the policy, so a run with nothing to report cannot name the file it must delete. Reusing one
+    /// output directory for a broken run followed by a clean one therefore produced a directory that disagreed with its own
+    /// summary: <c lang="json">"policyViolation":null</c> beside a counterexample naming a violation that had been fixed.
+    /// The assertion on the directory is the one that fails without the cleanup; the summary assertion would have passed
+    /// while the stale file sat next to it.
+    /// </remarks>
+    [Test]
+    public async Task RunCliCleanDropsStalePolicyAsync(CancellationToken cancellationToken)
+    {
+        var output = CreateTempDir();
+        try
+        {
+            var brokenCode = await ExploreRunner.RunCliAsync("transfer", output, BrokenMode.TransferHint);
+            _ = await Assert.That(brokenCode).IsEqualTo(0).Because("the injected fault manifests as a policy violation");
+            var staleReport = Path.Join(output, "policy-" + ProtocolPolicyChecker.HintSourceRetired + ".json");
+            _ = await Assert.That(File.Exists(staleReport)).IsTrue().Because("the broken run must leave the report this test then expects to disappear");
+
+            var cleanCode = await ExploreRunner.RunCliAsync("transfer", output, BrokenMode.None);
+            _ = await Assert.That(cleanCode).IsEqualTo(0);
+
+            var summary = await File.ReadAllTextAsync(Path.Join(output, "summary.json"), cancellationToken);
+            _ = await Assert.That(summary).Contains("\"policyViolation\":null", StringComparison.Ordinal);
+            _ = await Assert.That(Directory.GetFiles(output, "policy-*.json")).IsEmpty()
+                .Because("every generated policy report this run did not write is obsolete");
+        }
+        finally
+        {
+            Directory.Delete(output, true);
+        }
+    }
+
     private static string CreateTempDir()
     {
         var path = Path.Join(Path.GetTempPath(), "squirix-protocol-model-" + Guid.NewGuid().ToString("N"));

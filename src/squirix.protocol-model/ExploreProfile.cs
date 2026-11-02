@@ -28,6 +28,7 @@ internal sealed class ExploreProfile
         SymmetryReduce = flags.SymmetryReduce;
         AllowDiskLoss = flags.AllowDiskLoss;
         LogRules = flags.LogRules;
+        LeaderTransfer = flags.LeaderTransfer;
     }
 
     /// <summary>Gets a value indicating whether one node may lose its disk and a leader may repair it.</summary>
@@ -46,6 +47,13 @@ internal sealed class ExploreProfile
     /// explored by the other profiles. The resend is what lets an entry of an earlier term reach a majority in a later term.
     /// </remarks>
     internal bool LogRules { get; }
+
+    /// <summary>Gets a value indicating whether a leader may hand the term to one successor and a member refuses to campaign while it hears a live leader.</summary>
+    /// <remarks>
+    /// Off in the other profiles on purpose: their faults are reached by a member campaigning while a leader is reachable, which is
+    /// exactly what the leader-contact rule forbids, so turning it on everywhere would make those counterexamples unreachable.
+    /// </remarks>
+    internal bool LeaderTransfer { get; }
 
     internal int Majority => (ReplicaCount / 2) + 1;
 
@@ -76,11 +84,13 @@ internal sealed class ExploreProfile
     {
         var isSmall = string.Equals(profile, "small", StringComparison.OrdinalIgnoreCase);
         var isFull = string.Equals(profile, "full", StringComparison.OrdinalIgnoreCase);
-        return (isSmall, isFull) switch
+        var isTransfer = string.Equals(profile, "transfer", StringComparison.OrdinalIgnoreCase);
+        return (isSmall, isFull, isTransfer) switch
         {
-            (true, _) => Small(symmetryReduce),
-            (false, true) => Full(symmetryReduce),
-            (false, false) => throw new ArgumentOutOfRangeException(nameof(profile), profile, "Expected small or full."),
+            (true, _, _) => Small(symmetryReduce),
+            (_, true, _) => Full(symmetryReduce),
+            (_, _, true) => SmallTransferOneMoreTerm(symmetryReduce),
+            (_, _, _) => throw new ArgumentOutOfRangeException(nameof(profile), profile, "Expected small, full or transfer."),
         };
     }
 
@@ -150,6 +160,44 @@ internal sealed class ExploreProfile
 
     internal static ExploreProfile SmallRead(bool symmetryReduce = true) => SmallProfile("small-read", 1, symmetryReduce, 300_000);
 
+    /// <summary>Builds the transfer profile: three replicas, two terms, one entry and the messages one election needs.</summary>
+    /// <remarks>
+    /// This is the profile whose bounds make a replay test uninformative, and it is kept for the tests that only need a
+    /// campaign to be possible. The CLI and the two invariant tests use <see cref="SmallTransferOneMoreTerm" />.
+    /// </remarks>
+    /// <returns>The profile.</returns>
+    /// <remarks>
+    /// Two messages in flight are the two vote requests of a campaign: the hint is taken out of flight before the campaign it
+    /// starts adds them. Reads are left out, because a hint changes when a term begins and never what a read is checked
+    /// against, and the read profiles explore that rule already.
+    /// </remarks>
+    /// <param name="symmetryReduce">Whether states that differ only by renaming members are merged.</param>
+    internal static ExploreProfile SmallTransfer(bool symmetryReduce = true) => new(
+        "small-transfer",
+        new ExploreBounds(3, 2, 1, 2, 0, 300_000),
+        new ExploreFlags(false, false, symmetryReduce, false, false, true));
+
+    /// <summary>Builds the transfer profile with one more term, so a successor that honours a stale hint can leave the term it is in.</summary>
+    /// <returns>The profile.</returns>
+    /// <remarks>
+    /// A replay test on <see cref="SmallTransfer" /> cannot fail: its ceiling is two terms, and a successor that has already
+    /// campaigned sits at the second one, so an honoured stale hint finds term three above the ceiling and produces nothing.
+    /// The extra term is what makes honouring the hint observable.
+    /// <para>
+    /// The result this profile carries assumes timely delivery, and says so rather than modelling expiry.
+    /// The explorer's <c lang="csharp">HearsLiveLeader</c> rule reads network reachability as recent leader contact, while the
+    /// production rule depends on elapsed time since a contact was received; allowing no partitions does not make delivery
+    /// timely, since a connected follower can time out while leader messages are delayed. Executions that depend on delayed
+    /// contact are outside these bounds and outside every claim made on them, and contact expiry is not modelled here.
+    /// </para>
+    /// </remarks>
+    /// <param name="symmetryReduce">Whether states that differ only by renaming members are merged.</param>
+    /// <param name="maxStates">The state budget, so a caller can explore a bound the default is too small for.</param>
+    internal static ExploreProfile SmallTransferOneMoreTerm(bool symmetryReduce = true, int maxStates = 300_000) => new(
+        "small-transfer-3-terms",
+        new ExploreBounds(3, 3, 1, 2, 0, maxStates),
+        new ExploreFlags(false, false, symmetryReduce, false, false, true));
+
     private static ExploreProfile Full(bool symmetryReduce = true) => new(
         "full",
         new ExploreBounds(3, 3, 3, 4, 1, 50_000),
@@ -168,5 +216,5 @@ internal sealed class ExploreProfile
 
     [StructLayout(LayoutKind.Auto)]
     [Immutable]
-    private readonly record struct ExploreFlags(bool AllowCrash, bool AllowPartition, bool SymmetryReduce, bool AllowDiskLoss, bool LogRules);
+    private readonly record struct ExploreFlags(bool AllowCrash, bool AllowPartition, bool SymmetryReduce, bool AllowDiskLoss, bool LogRules, bool LeaderTransfer = false);
 }

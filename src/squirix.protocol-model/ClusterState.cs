@@ -15,7 +15,7 @@ internal sealed class ClusterState
         IReadOnlyList<InFlightMessage> messages,
         IReadOnlyList<int> partitions,
         int nextMessageId,
-        (IReadOnlyList<int> MatchIndexes, int DiskLosses, IReadOnlyList<ModelCommitDecision> Commits) progress)
+        (IReadOnlyList<int> MatchIndexes, int DiskLosses, IReadOnlyList<ModelCommitDecision> Commits, IReadOnlyList<ModelElectionRecord> Elections) progress)
     {
         Nodes = CopyNodes(nodes);
         Messages = CopyMessages(messages);
@@ -24,10 +24,17 @@ internal sealed class ClusterState
         MatchIndexes = CopyInts(progress.MatchIndexes);
         DiskLosses = progress.DiskLosses;
         CommittedEntries = ModelCommitHistory.Record(progress.Commits, Nodes);
+        ElectedLeaders = ModelElectionHistory.Record(progress.Elections, Nodes);
     }
 
     /// <summary>Gets persistent checker evidence, including the decision term rather than only the entry term.</summary>
     internal IReadOnlyList<ModelCommitDecision> CommittedEntries { get; }
+
+    /// <summary>
+    /// Gets the election evidence, one record per node that has held leadership in the term it held it in.
+    /// A leader that retires stops being a leader, so this is what keeps the election visible to the checker afterwards.
+    /// </summary>
+    internal IReadOnlyList<ModelElectionRecord> ElectedLeaders { get; }
 
     /// <summary>Gets the number of disk losses so far; a profile bounds it.</summary>
     internal int DiskLosses { get; }
@@ -54,7 +61,7 @@ internal sealed class ClusterState
             matchIndexes[i] = 0;
         }
 
-        return new ClusterState(nodes, Array.Empty<InFlightMessage>(), partitions, 1, (matchIndexes, 0, Array.Empty<ModelCommitDecision>()));
+        return new ClusterState(nodes, Array.Empty<InFlightMessage>(), partitions, 1, (matchIndexes, 0, Array.Empty<ModelCommitDecision>(), Array.Empty<ModelElectionRecord>()));
     }
 
     internal bool CanCommunicate(int from, int to) => Partitions[from] == Partitions[to];
@@ -81,7 +88,7 @@ internal sealed class ClusterState
     /// <param name="matchIndexes">The match indexes, the wiped node's reset.</param>
     /// <returns>The state with one more disk loss.</returns>
     internal ClusterState WithDiskLoss(IReadOnlyList<NodeState> nodes, IReadOnlyList<int> matchIndexes) =>
-        new(nodes, Messages, Partitions, NextMessageId, (matchIndexes, DiskLosses + 1, CommittedEntries));
+        new(nodes, Messages, Partitions, NextMessageId, (matchIndexes, DiskLosses + 1, CommittedEntries, ElectedLeaders));
 
     internal ClusterState WithMatchIndexes(IReadOnlyList<int> matchIndexes) => With(matchIndexes: matchIndexes);
 
@@ -103,6 +110,27 @@ internal sealed class ClusterState
         With(nodes, messages, matchIndexes: matchIndexes);
 
     internal ClusterState WithPartitions(IReadOnlyList<int> partitions) => With(partitions: partitions);
+
+    /// <summary>Returns the state with the named members replaced, the rest carried over.</summary>
+    /// <param name="nodes">The nodes, or <see langword="null" /> to keep them.</param>
+    /// <param name="messages">The messages, or <see langword="null" /> to keep them.</param>
+    /// <param name="partitions">The partitions, or <see langword="null" /> to keep them.</param>
+    /// <param name="nextMessageId">The next message id, or <see langword="null" /> to keep it.</param>
+    /// <param name="matchIndexes">The match indexes, or <see langword="null" /> to keep them.</param>
+    /// <param name="elections">The election evidence, or <see langword="null" /> to keep it.</param>
+    /// <returns>The state.</returns>
+    internal ClusterState With(
+        IReadOnlyList<NodeState>? nodes = null,
+        IReadOnlyList<InFlightMessage>? messages = null,
+        IReadOnlyList<int>? partitions = null,
+        int? nextMessageId = null,
+        IReadOnlyList<int>? matchIndexes = null,
+        IReadOnlyList<ModelElectionRecord>? elections = null) => new(
+        nodes ?? Nodes,
+        messages ?? Messages,
+        partitions ?? Partitions,
+        nextMessageId ?? NextMessageId,
+        (matchIndexes ?? MatchIndexes, DiskLosses, CommittedEntries, elections ?? ElectedLeaders));
 
     private static int[] CopyInts(IReadOnlyList<int> values)
     {
@@ -131,18 +159,6 @@ internal sealed class ClusterState
         return copy;
     }
 
-    private ClusterState With(
-        IReadOnlyList<NodeState>? nodes = null,
-        IReadOnlyList<InFlightMessage>? messages = null,
-        IReadOnlyList<int>? partitions = null,
-        int? nextMessageId = null,
-        IReadOnlyList<int>? matchIndexes = null) => new(
-        nodes ?? Nodes,
-        messages ?? Messages,
-        partitions ?? Partitions,
-        nextMessageId ?? NextMessageId,
-        (matchIndexes ?? MatchIndexes, DiskLosses, CommittedEntries));
-
     private static class FingerprintHelper
     {
         private const int InitialCapacity = 512;
@@ -150,6 +166,9 @@ internal sealed class ClusterState
 
         /// <summary>One writer per thread: building a fingerprint is synchronous and never re-enters itself, and a finished string is copied out.</summary>
         private static readonly ThreadLocal<FingerprintWriter> Writer = new(static () => new FingerprintWriter(InitialCapacity));
+
+        /// <summary>A second buffer, so a candidate labelling can be built while the chosen one is being compared with it.</summary>
+        private static readonly ThreadLocal<FingerprintWriter> Candidate = new(static () => new FingerprintWriter(InitialCapacity));
 
         internal static FingerprintWriter Write(ClusterState state, bool symmetryReduce)
         {
@@ -171,19 +190,10 @@ internal sealed class ClusterState
             return sb;
         }
 
-        private static void AppendCanonical(FingerprintWriter sb, ClusterState state)
-        {
-            var nodes = state.Nodes;
-            var count = nodes.Count;
-            var order = count <= MaxStackItems ? stackalloc int[count] : new int[count];
-            var map = count <= MaxStackItems ? stackalloc int[count] : new int[count];
-            BuildSymmetryOrder(nodes, order);
-            for (var i = 0; i < count; i++)
-                map[order[i]] = i;
-
-            AppendNodePartitions(sb, state, order, map);
-            AppendOrderedMessages(sb, state.Messages, map);
-        }
+        /// <summary>Writes the state with its members relabelled by symmetry order.</summary>
+        /// <param name="sb">The writer to append to.</param>
+        /// <param name="state">The state to write.</param>
+        private static void AppendCanonical(FingerprintWriter sb, ClusterState state) => CanonicalLabelling.Append(sb, state);
 
         private static void AppendField(FingerprintWriter sb, int value)
         {
@@ -263,6 +273,56 @@ internal sealed class ClusterState
                 sb.Append(state.MatchIndexes[source]);
                 sb.Append(';');
             }
+
+            if (state.ElectedLeaders.Count > 0)
+                AppendElectionHistory(sb, state.ElectedLeaders, map);
+        }
+
+        /// <summary>Appends the retained election evidence, relabelled by the same map as the nodes it names.</summary>
+        /// <param name="sb">The writer to append to.</param>
+        /// <param name="elections">The election evidence retained so far.</param>
+        /// <param name="map">The relabelling, empty when the state keeps its own labels.</param>
+        /// <remarks>
+        /// The evidence names a node, so it is a member the symmetry key has to relabel like any other. Written with the ids
+        /// the state happens to hold, two states that differ only by renaming keep different keys, the exploration stops
+        /// merging them, and the reduction silently costs the saving it exists to give.
+        /// </remarks>
+        private static void AppendElectionHistory(FingerprintWriter sb, IReadOnlyList<ModelElectionRecord> elections, ReadOnlySpan<int> map)
+        {
+            var count = elections.Count;
+            var order = count <= MaxStackItems ? stackalloc int[count] : new int[count];
+            for (var i = 0; i < count; i++)
+            {
+                var current = elections[i];
+                var j = i;
+                while (j > 0)
+                {
+                    var previous = elections[order[j - 1]];
+                    if (CompareElections(in previous, in current, map) <= 0)
+                        break;
+
+                    order[j] = order[j - 1];
+                    j--;
+                }
+
+                order[j] = i;
+            }
+
+            sb.Append('E');
+            for (var i = 0; i < count; i++)
+            {
+                var election = elections[order[i]];
+                sb.Append(election.Term);
+                sb.Append('@');
+                sb.Append(Mapped(map, election.NodeId));
+                sb.Append(';');
+            }
+        }
+
+        private static int CompareElections(in ModelElectionRecord a, in ModelElectionRecord b, ReadOnlySpan<int> map)
+        {
+            var c = a.Term.CompareTo(b.Term);
+            return c != 0 ? c : Mapped(map, a.NodeId).CompareTo(Mapped(map, b.NodeId));
         }
 
         private static void AppendOrderedMessages(FingerprintWriter sb, IReadOnlyList<InFlightMessage> messages, ReadOnlySpan<int> map)
@@ -329,22 +389,6 @@ internal sealed class ClusterState
             AppendOrderedMessages(sb, state.Messages, default);
         }
 
-        private static void BuildSymmetryOrder(IReadOnlyList<NodeState> nodes, Span<int> order)
-        {
-            var comparer = new NodeOrderComparer(nodes);
-            for (var i = 0; i < order.Length; i++)
-            {
-                var j = i;
-                while (j > 0 && comparer.Compare(order[j - 1], i) > 0)
-                {
-                    order[j] = order[j - 1];
-                    j--;
-                }
-
-                order[j] = i;
-            }
-        }
-
         private static int CompareMessageBodies(in InFlightMessage a, in InFlightMessage b)
         {
             var c = a.LastLogIndex.CompareTo(b.LastLogIndex);
@@ -397,6 +441,7 @@ internal sealed class ClusterState
             MsgKind.AppendResponse => 3,
             MsgKind.ReadIndexRequest => 4,
             MsgKind.ReadIndexResponse => 5,
+            MsgKind.TransferHint => 6,
             _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "Unsupported enum value."),
         };
 
@@ -425,6 +470,16 @@ internal sealed class ClusterState
 
             public int Compare(int x, int y)
             {
+                var c = CompareKey(x, y);
+                return c != 0 ? c : x.CompareTo(y);
+            }
+
+            /// <summary>Compares the two members on the fields the key prints, and reports a tie when it finds none.</summary>
+            /// <param name="x">The first member.</param>
+            /// <param name="y">The second member.</param>
+            /// <returns>The comparison, without the label tie-break <see cref="Compare" /> adds.</returns>
+            internal int CompareKey(int x, int y)
+            {
                 var a = _nodes[x];
                 var b = _nodes[y];
                 var c = CompareTermState(a, b);
@@ -434,7 +489,7 @@ internal sealed class ClusterState
                 if (c == 0)
                     c = CompareLogs(a.LogEntries, b.LogEntries);
 
-                return c != 0 ? c : x.CompareTo(y);
+                return c;
             }
 
             private static int CompareLogs(IReadOnlyList<LogEntry> a, IReadOnlyList<LogEntry> b)
@@ -495,6 +550,169 @@ internal sealed class ClusterState
                 (false, true) => 0,
                 (false, false) => 1,
             };
+        }
+
+        /// <summary>Relabels the members so the key depends on the state and not on the labels.</summary>
+        /// <remarks>
+        /// The order leaves two members tied when every field the key compares is equal, and ordering tied members by id makes
+        /// the key depend on the labels it exists to forget: two states that differ only by renaming then print their votes and
+        /// messages against different ranks and get different keys, so the exploration stops merging them and a comparison
+        /// between the reduced and unreduced runs measures the tie-break rather than the model. The labellings of each tied run
+        /// are enumerated and the smallest is kept, because renaming permutes that candidate set and the smallest element of a
+        /// permuted set is the same element.
+        /// </remarks>
+        private static class CanonicalLabelling
+        {
+            private const int MaxLabellings = 24;
+
+            /// <summary>Appends the smallest labelling of the state under the members the ordering key cannot separate.</summary>
+            /// <param name="sb">The writer to append to.</param>
+            /// <param name="state">The state to write.</param>
+            internal static void Append(FingerprintWriter sb, ClusterState state)
+            {
+                var nodes = state.Nodes;
+                var count = nodes.Count;
+                var order = new int[count];
+                BuildSymmetryOrder(nodes, order);
+
+                var starts = new int[count];
+                var lengths = new int[count];
+                var runCount = BuildTieRuns(nodes, order, starts, lengths);
+                if (runCount == 0)
+                {
+                    AppendBody(sb, state, order);
+                    return;
+                }
+
+                var labellings = 1;
+                for (var i = 0; i < runCount; i++)
+                    labellings *= Factorial(lengths[i]);
+
+                if (labellings > MaxLabellings)
+                {
+                    // Too many tied members to enumerate: this state keeps its own labels and is never merged with another.
+                    // Nothing becomes unreachable; the run only loses the saving the reduction would have given it.
+                    sb.Append('!');
+                    AppendNodePartitions(sb, state, default, default);
+                    AppendOrderedMessages(sb, state.Messages, default);
+                    return;
+                }
+
+                AppendSmallest(sb, state, new LabellingPlan(order, starts, lengths, runCount, labellings));
+            }
+
+            private static void AppendBody(FingerprintWriter sb, ClusterState state, int[] order)
+            {
+                var map = new int[order.Length];
+                ApplyOrder(order, map);
+                AppendNodePartitions(sb, state, order, map);
+                AppendOrderedMessages(sb, state.Messages, map);
+            }
+
+            private static void AppendSmallest(FingerprintWriter sb, ClusterState state, in LabellingPlan plan)
+            {
+                var candidate = Candidate.Value!;
+                var listed = new int[plan.Order.Length];
+                var map = new int[plan.Order.Length];
+                string? best = null;
+                for (var index = 0; index < plan.Labellings; index++)
+                {
+                    Array.Copy(plan.Order, listed, listed.Length);
+                    var rest = index;
+                    for (var run = 0; run < plan.RunCount; run++)
+                    {
+                        var block = Factorial(plan.Lengths[run]);
+                        var pick = rest % block;
+                        rest /= block;
+                        var members = plan.Order.AsSpan(plan.Starts[run], plan.Lengths[run]);
+                        WritePermutation(members, pick, listed.AsSpan(plan.Starts[run], plan.Lengths[run]));
+                    }
+
+                    ApplyOrder(listed, map);
+                    candidate.Clear();
+                    AppendNodePartitions(candidate, state, listed, map);
+                    AppendOrderedMessages(candidate, state.Messages, map);
+                    var text = candidate.ToString();
+                    if (best == null || string.CompareOrdinal(text, best) < 0)
+                        best = text;
+                }
+
+                sb.Append(best);
+            }
+
+            private static int BuildTieRuns(IReadOnlyList<NodeState> nodes, ReadOnlySpan<int> order, Span<int> starts, Span<int> lengths)
+            {
+                var comparer = new NodeOrderComparer(nodes);
+                var runCount = 0;
+                var i = 0;
+                while (i < order.Length)
+                {
+                    var j = i + 1;
+                    while (j < order.Length && comparer.CompareKey(order[j - 1], order[j]) == 0)
+                        j++;
+
+                    if (j - i > 1)
+                    {
+                        starts[runCount] = i;
+                        lengths[runCount] = j - i;
+                        runCount++;
+                    }
+
+                    i = j;
+                }
+
+                return runCount;
+            }
+
+            private static void BuildSymmetryOrder(IReadOnlyList<NodeState> nodes, Span<int> order)
+            {
+                var comparer = new NodeOrderComparer(nodes);
+                for (var i = 0; i < order.Length; i++)
+                {
+                    var j = i;
+                    while (j > 0 && comparer.Compare(order[j - 1], i) > 0)
+                    {
+                        order[j] = order[j - 1];
+                        j--;
+                    }
+
+                    order[j] = i;
+                }
+            }
+
+            private static void WritePermutation(ReadOnlySpan<int> members, int index, Span<int> destination)
+            {
+                Span<int> available = members.Length <= MaxStackItems ? stackalloc int[members.Length] : new int[members.Length];
+                members.CopyTo(available);
+                var remaining = members.Length;
+                var rest = index;
+                for (var i = 0; i < destination.Length; i++)
+                {
+                    var block = Factorial(remaining - 1);
+                    var pick = block == 0 ? 0 : rest / block;
+                    rest -= pick * block;
+                    destination[i] = available[pick];
+                    available.Slice(pick + 1).CopyTo(available.Slice(pick));
+                    remaining--;
+                }
+            }
+
+            private static void ApplyOrder(ReadOnlySpan<int> order, Span<int> map)
+            {
+                for (var i = 0; i < order.Length; i++)
+                    map[order[i]] = i;
+            }
+
+            private static int Factorial(int value)
+            {
+                var result = 1;
+                for (var i = 2; i <= value; i++)
+                    result *= i;
+
+                return result;
+            }
+
+            private readonly record struct LabellingPlan(int[] Order, int[] Starts, int[] Lengths, int RunCount, int Labellings);
         }
     }
 }

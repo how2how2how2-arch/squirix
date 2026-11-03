@@ -95,6 +95,7 @@ public sealed class KnownEntryLengthTests : IsolatedStorageTestBase
         foreach (var (payload, ticks) in new[]
                  {
                      (withDeadline, 0L), (withDeadline, deadline.Ticks), (withoutDeadline, 0L), (withoutDeadline, deadline.Ticks),
+                     (withDeadline, deadline.AddTicks(1).Ticks),
                      (relative, 0L), (relative, deadline.Ticks), (both, 0L), (both, deadline.Ticks),
                  })
         {
@@ -102,12 +103,56 @@ public sealed class KnownEntryLengthTests : IsolatedStorageTestBase
 
             _ = await Assert.That(isDecoded).IsTrue();
             _ = await Assert.That(length).IsEqualTo(JournalEntryPayload.MeasureSerializedBytes(entry!));
+            _ = await Assert.That(entry!.ExpiresUtc).IsEqualTo(ticks == 0 ? null : new DateTime(ticks, DateTimeKind.Utc));
+            _ = await Assert.That(entry.Expiration).IsNull();
+            _ = await Assert.That(entry.Version).IsEqualTo(3L);
+            _ = await Assert.That(entry.Tags).IsNotNull();
+            foreach (var tag in Tags())
+                _ = await Assert.That(entry.Tags![tag.Key]).IsEqualTo(tag.Value);
+            var json = (await Assert.That(entry.Value).IsTypeOf<JsonUtf8Value>())!;
+            await SequenceAssert.EqualAsync(JsonValueKit.Create(Tree.GetRawText()).Bytes.ToArray(), json.Bytes.ToArray());
         }
 
         var padded = new byte[withDeadline.Length + 1];
         withDeadline.CopyTo(padded, 0);
         _ = await Assert.That(JournalEntryPayload.TryDecodeWithDeadline(padded, deadline.Ticks, out _, out var paddedLength)).IsTrue();
         _ = await Assert.That(paddedLength).IsNull();
+    }
+
+    /// <summary>A matching deadline avoids the extra entry allocation required to replace a deadline.</summary>
+    [Test]
+    public async Task MatchingDeadlineAvoidsAllocation()
+    {
+        const int iterations = 256;
+        var deadline = new DateTime(2030, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var replacementTicks = deadline.AddTicks(1).Ticks;
+        var payload = JournalEntryPayloadKit.Encode(new NodeCacheEntry<object?>("value", 3, deadline));
+        for (var i = 0; i < iterations; i++)
+        {
+            _ = JournalEntryPayload.TryDecodeWithDeadline(payload, deadline.Ticks, out var matching, out _);
+            _ = JournalEntryPayload.TryDecodeWithDeadline(payload, replacementTicks, out var replacement, out _);
+            GC.KeepAlive(matching);
+            GC.KeepAlive(replacement);
+        }
+
+        // No await or assertion runs within either same-thread allocation interval.
+        var start = GC.GetAllocatedBytesForCurrentThread();
+        for (var i = 0; i < iterations; i++)
+        {
+            _ = JournalEntryPayload.TryDecodeWithDeadline(payload, deadline.Ticks, out var entry, out _);
+            GC.KeepAlive(entry);
+        }
+
+        var matchingBytes = GC.GetAllocatedBytesForCurrentThread() - start;
+        start = GC.GetAllocatedBytesForCurrentThread();
+        for (var i = 0; i < iterations; i++)
+        {
+            _ = JournalEntryPayload.TryDecodeWithDeadline(payload, replacementTicks, out var entry, out _);
+            GC.KeepAlive(entry);
+        }
+
+        var replacementBytes = GC.GetAllocatedBytesForCurrentThread() - start;
+        _ = await Assert.That(matchingBytes).IsLessThan(replacementBytes);
     }
 
     /// <summary>

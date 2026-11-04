@@ -313,7 +313,7 @@ internal sealed class PhysicalCache<T> : ILocalCache<T>, ILocalCacheSnapshotRead
 
         if (_eviction.Policy is EvictionPolicyType.Lfu)
         {
-            node.Frequency++;
+            node.Frequency = CacheAccessFrequency.Increment(node.Frequency);
             return;
         }
 
@@ -328,7 +328,7 @@ internal sealed class PhysicalCache<T> : ILocalCache<T>, ILocalCacheSnapshotRead
             node.OrderNode = _order.AddFirst(key);
         }
 
-        node.Frequency++;
+        node.Frequency = CacheAccessFrequency.Increment(node.Frequency);
     }
 
     private bool TryGetLiveLocked(CacheKey key, bool touchOrder, [NotNullWhen(true)] out Node? node)
@@ -800,11 +800,13 @@ internal sealed class PhysicalCache<T> : ILocalCache<T>, ILocalCacheSnapshotRead
 
             for (var node = order.Last; node != null; node = node.Previous)
             {
-                if (!TryGetLocked(node.Value, out var entry) || entry.Frequency >= minFrequency)
+                if (!TryGetLocked(node.Value, out var entry) || (chosen != null && entry.Frequency >= minFrequency))
                     continue;
 
                 minFrequency = entry.Frequency;
                 chosen = node.Value;
+                if (minFrequency == 1)
+                    break;
             }
 
             return chosen;
@@ -1074,20 +1076,7 @@ internal sealed class PhysicalCache<T> : ILocalCache<T>, ILocalCacheSnapshotRead
 
             // The rebuild reads the current deadline of every entry, this one included.
             _heap.Clear();
-            var nodes = store.GetEnumerator();
-            while (nodes.MoveNext())
-            {
-                var stored = nodes.Current;
-                if (stored.ExpiresUtc is { } expires)
-                {
-                    Index(stored, expires.Ticks);
-                }
-                else
-                {
-                    stored.IndexedTicks = long.MaxValue;
-                    stored.IndexedGeneration++;
-                }
-            }
+            _heap.EnqueueRange(CurrentDeadlines());
         }
 
         /// <summary>Pops the top item when it is due.</summary>
@@ -1103,6 +1092,25 @@ internal sealed class PhysicalCache<T> : ILocalCache<T>, ILocalCacheSnapshotRead
 
             _ = heap.Dequeue();
             return true;
+        }
+
+        private IEnumerable<(Deadline Element, long Priority)> CurrentDeadlines()
+        {
+            var nodes = _owner._store.GetEnumerator();
+            while (nodes.MoveNext())
+            {
+                var stored = nodes.Current;
+                stored.IndexedGeneration++;
+                if (stored.ExpiresUtc is { } expires)
+                {
+                    stored.IndexedTicks = expires.Ticks;
+                    yield return (new Deadline(stored, expires.Ticks, stored.IndexedGeneration), expires.Ticks);
+                }
+                else
+                {
+                    stored.IndexedTicks = long.MaxValue;
+                }
+            }
         }
 
         /// <summary>Pushes the canonical item of an entry, which makes every other item of the entry stale.</summary>

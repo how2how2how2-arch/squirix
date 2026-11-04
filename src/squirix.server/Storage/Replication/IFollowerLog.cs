@@ -148,6 +148,12 @@ internal interface IFollowerLog : IAsyncDisposable
     /// </remarks>
     ValueTask<FollowerLogTail> GetLeaderTailAsync(CancellationToken cancellationToken);
 
+    /// <summary>Reads status and the current-term commit predicate without materializing the uncommitted tail.</summary>
+    /// <param name="term">The leader term to check.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The paired status and whether its tail is empty or contains an entry of the requested term.</returns>
+    ValueTask<(FollowerLogStatus Status, bool CanCommit)> GetCommitReadinessAsync(ulong term, CancellationToken cancellationToken);
+
     /// <summary>Gets a snapshot of the durable log state.</summary>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>A snapshot of the durable log state.</returns>
@@ -159,6 +165,12 @@ internal interface IFollowerLog : IAsyncDisposable
     /// <returns>The term at <paramref name="logIndex" />; zero at the log origin.</returns>
     /// <exception cref="System.IO.InvalidDataException">The log retains no term for a non-zero <paramref name="logIndex" />.</exception>
     ValueTask<ulong> GetTermAtAsync(ulong logIndex, CancellationToken cancellationToken);
+
+    /// <summary>Finds the first retained index in the consecutive term run ending at an index.</summary>
+    /// <param name="logIndex">The index whose term run is sought.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The first index of that retained run, or the supplied index when it is no longer retained.</returns>
+    ValueTask<ulong> GetTermStartAsync(ulong logIndex, CancellationToken cancellationToken);
 
     /// <summary>Returns the durable entries above the committed index, in index order.</summary>
     /// <param name="cancellationToken">Cancellation token.</param>

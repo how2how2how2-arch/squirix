@@ -21,6 +21,7 @@ internal sealed class NodeState
         ReadIndex = runtime.ReadIndex;
         ReadAcks = runtime.ReadAcks;
         ReadReady = runtime.ReadReady;
+        Stopping = runtime.Stopping;
     }
 
     internal int AppliedIndex { get; }
@@ -48,6 +49,14 @@ internal sealed class NodeState
     internal int VotedFor { get; }
 
     internal int VotesGranted { get; }
+
+    /// <summary>Gets a value indicating whether this process has stopped: it has retired and cannot campaign again in this lifecycle.</summary>
+    /// <remarks>
+    /// Volatile, not durable: it lives with the process and a restart clears it, which is why it is carried on the runtime
+    /// value rather than on the log. A restart is modelled by the disk loss and the repair that follows it, so both of
+    /// those clear the flag and the member may acquire authority again from a fresh process.
+    /// </remarks>
+    internal bool Stopping { get; }
 
     /// <summary>Gets a value indicating whether the copy lost its disk: it votes for nobody, takes no entries and never campaigns until repaired.</summary>
     internal bool Unseeded { get; }

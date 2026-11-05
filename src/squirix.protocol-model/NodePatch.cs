@@ -27,5 +27,7 @@ internal sealed class NodePatch
 
     internal int? VotesGranted { get; init; }
 
+    internal bool? Stopping { get; init; }
+
     internal bool? Unseeded { get; init; }
 }

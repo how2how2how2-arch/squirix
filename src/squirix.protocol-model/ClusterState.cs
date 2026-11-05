@@ -243,6 +243,8 @@ internal sealed class ClusterState
             AppendField(sb, identity.ReadAcks);
             sb.AppendFlag(n.ReadReady);
             sb.Append(',');
+            sb.AppendFlag(n.Stopping);
+            sb.Append(',');
             sb.AppendFlag(n.Unseeded);
             sb.Append(',');
             sb.Append('[');
@@ -523,6 +525,10 @@ internal sealed class ClusterState
                     return c;
 
                 c = a.ReadReady.CompareTo(b.ReadReady);
+                if (c != 0)
+                    return c;
+
+                c = a.Stopping.CompareTo(b.Stopping);
                 return c != 0 ? c : a.Unseeded.CompareTo(b.Unseeded);
             }
 

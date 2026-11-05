@@ -120,7 +120,8 @@ internal static class ModelTransitionUtil
                 patch.VotesGranted ?? node.VotesGranted,
                 patch.ReadIndex ?? node.ReadIndex,
                 patch.ReadAcks ?? node.ReadAcks,
-                patch.ReadReady ?? node.ReadReady),
+                patch.ReadReady ?? node.ReadReady,
+                patch.Stopping ?? node.Stopping),
             patch.Unseeded ?? node.Unseeded);
     }
 

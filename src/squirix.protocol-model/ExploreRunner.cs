@@ -247,7 +247,7 @@ internal static class ExploreRunner
                                 + "-leader-completeness-all-leaders-commit-decision-history"
                                 + "-leader-contact-transfer-hint-serving-eligibility-retirement-keeps-its-vote"
                                 + "-hint-names-every-tied-successor-hint-reception-guards-emission-policy"
-                                + "-election-history-survives-retirement";
+                                + "-election-history-survives-retirement-retirement-closes-admission-until-restart";
         var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(semantic));
         var sb = new StringBuilder(16);
         for (var i = 0; i < 8; i++)
@@ -734,6 +734,12 @@ internal static class ExploreRunner
             if (node.Role is NodeRole.Leader || node.Unseeded)
                 return false;
 
+            // A retired member has closed its admission for this process lifecycle, so it does not campaign again even
+            // though it is now an ordinary follower. Losing the hint it sent must not hand the leadership back: D1 keeps
+            // admission closed until a restart, which in this model is the disk loss and the repair that follows it.
+            if (node.Stopping)
+                return false;
+
             // Leader contact: a member that hears a live leader keeps resetting its election timer, so it does not
             // campaign. A transfer hint is the only thing that names a member to campaign anyway, and it confers
             // nothing beyond that: the votes are the ones it would collect at any other moment.
@@ -988,7 +994,9 @@ internal static class ExploreRunner
                     for (var k = 0; k < successors.Count; k++)
                     {
                         var nodes = ModelTransitionUtil.CloneNodes(state.Nodes);
-                        nodes[i] = ModelRpcCommit.DemoteFollower(leader, leader.CurrentTerm);
+                        nodes[i] = ModelTransitionUtil.Patch(
+                            ModelRpcCommit.DemoteFollower(leader, leader.CurrentTerm),
+                            new NodePatch { Stopping = true });
                         var messages = ModelTransitionUtil.CloneMessages(state.Messages);
                         messages.Add(new InFlightMessage(state.NextMessageId, MessagePayload.TransferHint(i, successors[k], leader.CurrentTerm)));
                         output.Add(state.WithNodesMessages(nodes, messages, state.NextMessageId + 1));
@@ -1219,6 +1227,7 @@ internal static class ExploreRunner
                         CommitIndex = leader.CommitIndex,
                         AppliedIndex = leader.CommitIndex,
                         Unseeded = false,
+                        Stopping = false,
                     });
                 return state.WithNodes(nodes);
             }

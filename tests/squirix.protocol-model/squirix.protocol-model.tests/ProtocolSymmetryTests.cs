@@ -115,7 +115,8 @@ public sealed class ProtocolSymmetryTests
                 VoteMask.Remap(node.VotesGranted, permutation),
                 node.ReadIndex,
                 VoteMask.Remap(node.ReadAcks, permutation),
-                node.ReadReady);
+                node.ReadReady,
+                node.Stopping);
             nodes[id] = new NodeState(id, node.Role, node.CurrentTerm, votedFor, node.LogEntries, in runtime, node.Unseeded);
             partitions[id] = state.Partitions[i];
             matchIndexes[id] = state.MatchIndexes[i];

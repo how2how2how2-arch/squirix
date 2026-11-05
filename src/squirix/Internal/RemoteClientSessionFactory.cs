@@ -19,7 +19,7 @@ namespace Squirix.Internal;
 
 internal static class RemoteClientSessionFactory
 {
-    internal static async ValueTask<IRemoteClientSession> ConnectAsync(
+    internal static async ValueTask<RemoteClientSession> ConnectAsync(
         IList<Uri> endpoints,
         Func<CancellationToken, ValueTask<string>>? bearerTokenProvider,
         ISquirixSerializer? serializer,
@@ -62,10 +62,9 @@ internal static class RemoteClientSessionFactory
 
     /// <summary>Creates the serializer used by remote client sessions (metrics-decorated by default).</summary>
     /// <param name="serializer">Optional inner serializer; defaults to System.Text.Json.</param>
-    /// <param name="enableMetrics">When <see langword="true" />, wraps the serializer with metrics recording.</param>
     /// <returns>Configured serializer instance.</returns>
-    internal static ISquirixSerializer CreateSerializer(ISquirixSerializer? serializer = null, bool enableMetrics = true) =>
-        SerializationProvider.Create(serializer, enableMetrics);
+    internal static ISquirixSerializer CreateSerializer(ISquirixSerializer? serializer = null) =>
+        SerializationProvider.Create(serializer);
 
     private static CallCredentials? BuildCallCredentials(Func<CancellationToken, ValueTask<string>>? provider) =>
         provider == null ? null : new BearerTokenCallCredentials(provider).Credentials;
@@ -137,10 +136,10 @@ internal static class RemoteClientSessionFactory
 
     private static class SerializationProvider
     {
-        internal static ISquirixSerializer Create(ISquirixSerializer? serializer = null, bool enableMetrics = true)
+        internal static ISquirixSerializer Create(ISquirixSerializer? serializer = null)
         {
             var effective = serializer ?? new SystemTextJsonSerializer();
-            return enableMetrics ? EnsureMetrics(effective) : effective;
+            return EnsureMetrics(effective);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -272,17 +271,17 @@ internal static class RemoteClientSessionFactory
             private void Record(string op, bool success, long startTimestamp)
             {
                 var elapsedSeconds = Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds;
-                SerializerMetrics.OpsTotal.WithLabels(op, success ? "ok" : "error", _impl).Inc(1);
-                SerializerMetrics.OpDurationSeconds.WithLabels(op, _impl).Observe(elapsedSeconds);
+                SerializerMetrics.OpsTotal.Add(op, success ? "ok" : "error", _impl, 1);
+                SerializerMetrics.OpDurationSeconds.Record(op, _impl, elapsedSeconds);
             }
 
             private void RecordFailure(string op, Exception ex, long startTimestamp)
             {
                 var elapsedSeconds = Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds;
-                SerializerMetrics.OpsTotal.WithLabels(op, "error", _impl).Inc(1);
-                SerializerMetrics.OpDurationSeconds.WithLabels(op, _impl).Observe(elapsedSeconds);
+                SerializerMetrics.OpsTotal.Add(op, "error", _impl, 1);
+                SerializerMetrics.OpDurationSeconds.Record(op, _impl, elapsedSeconds);
                 var exType = ex.GetType().Name;
-                SerializerMetrics.FailuresTotal.WithLabels(op, exType, _impl).Inc(1);
+                SerializerMetrics.FailuresTotal.Add(op, exType, _impl, 1);
             }
 
             private bool TryRecordSerializerFailure(string op, Exception ex, long startTimestamp)
@@ -348,31 +347,5 @@ internal static class RemoteClientSessionFactory
             _cachedAuthorizationHeader = header;
             return header;
         }
-    }
-
-    [Immutable]
-    private sealed class RemoteClientSession : IRemoteClientSession
-    {
-        private readonly EndpointFailover _bootstrapFailover;
-        private readonly IClientPool _remoteClients;
-        private readonly ISquirixSerializer _serializer;
-
-        internal RemoteClientSession(IClientPool remoteClients, EndpointFailover bootstrapFailover, ISquirixSerializer serializer)
-        {
-            ArgumentNullException.ThrowIfNull(remoteClients);
-            ArgumentNullException.ThrowIfNull(bootstrapFailover);
-            ArgumentNullException.ThrowIfNull(serializer);
-            _remoteClients = remoteClients;
-            _bootstrapFailover = bootstrapFailover;
-            _serializer = serializer;
-        }
-
-        public ValueTask DisposeAsync()
-        {
-            _remoteClients.BeginDrain();
-            return _remoteClients.DisposeAsync();
-        }
-
-        public ICache<T> GetCache<T>(string cacheName) => new RemoteCache<T>(cacheName, _bootstrapFailover, _remoteClients, _serializer);
     }
 }

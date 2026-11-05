@@ -53,8 +53,10 @@ internal sealed class NodeState
     /// <summary>Gets a value indicating whether this process has stopped: it has retired and cannot campaign again in this lifecycle.</summary>
     /// <remarks>
     /// Volatile, not durable: it lives with the process and a restart clears it, which is why it is carried on the runtime
-    /// value rather than on the log. A restart is modelled by the disk loss and the repair that follows it, so both of
-    /// those clear the flag and the member may acquire authority again from a fresh process.
+    /// value rather than on the log. Two transitions restart a process here, and each clears the flag: a collected crash,
+    /// which rebuilds the runtime value from the durable state, and the loss of the disk followed by its repair. So a
+    /// crash with an intact disk already reopens admission, and the member may acquire authority again from a fresh
+    /// process without any disk loss.
     /// </remarks>
     internal bool Stopping { get; }
 

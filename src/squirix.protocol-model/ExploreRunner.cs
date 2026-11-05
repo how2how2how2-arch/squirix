@@ -736,7 +736,8 @@ internal static class ExploreRunner
 
             // A retired member has closed its admission for this process lifecycle, so it does not campaign again even
             // though it is now an ordinary follower. Losing the hint it sent must not hand the leadership back: D1 keeps
-            // admission closed until a restart, which in this model is the disk loss and the repair that follows it.
+            // admission closed until the process restarts. Two transitions restart one here: a collected crash rebuilds
+            // the runtime value from durable state, and losing the disk plus the repair that follows it clears it too.
             if (node.Stopping)
                 return false;
 

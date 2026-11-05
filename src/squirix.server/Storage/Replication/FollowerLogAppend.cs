@@ -87,12 +87,6 @@ internal static class FollowerLogAppend
         if (error != null)
             return error.Value;
 
-        // Materialize payload ownership for the appending set synchronously, before the first awaits: once
-        // the durable writing is scheduled, it must never reference the caller's buffer, and a cancellation
-        // during truncation aborts the batch without writing any frame.
-        if (toAppend != null)
-            OwnPayloads(toAppend);
-
         if (truncateAtIndex != null)
         {
             try
@@ -320,17 +314,6 @@ internal static class FollowerLogAppend
                              existing.PayloadSpan.SequenceEqual(candidate.PayloadSpan);
         var appliedSatisfied = candidate.LogIndex <= owner.Meta.LastAppliedIndex && journal.TryGetEntryOffset(candidate.LogIndex, out var loc) && loc.Term == candidate.Term;
         return localSatisfied || appliedSatisfied;
-    }
-
-    private static void OwnPayloads(List<FollowerLogEntry> entries)
-    {
-        // Ownership is needed only for what will actually hit disk or be retained above the applied
-        // watermark; duplicates satisfied by local state and refused batches are never copied.
-        for (var i = 0; i < entries.Count; i++)
-        {
-            var entry = entries[i];
-            entries[i] = entry with { Payload = entry.Payload.ToArray() };
-        }
     }
 
     private static FollowerLogAppendResult? PrepareAppendBatch(

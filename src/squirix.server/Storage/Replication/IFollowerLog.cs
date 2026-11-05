@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 namespace Squirix.Server.Storage.Replication;
 
 /// <summary>Durable, ordered follower log for one replica group.</summary>
+/// <remarks>Appends retain immutable entry payloads directly. Callers must not mutate their bytes or return them to a pool.</remarks>
 internal interface IFollowerLog : IAsyncDisposable
 {
     /// <summary>Gets the replica group identifier.</summary>

@@ -29,5 +29,9 @@ internal sealed class NodePatch
 
     internal bool? Stopping { get; init; }
 
+    internal int? KnownLeaderTerm { get; init; }
+
+    internal int? KnownLeaderId { get; init; }
+
     internal bool? Unseeded { get; init; }
 }

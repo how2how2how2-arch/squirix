@@ -5,7 +5,16 @@ namespace Squirix.ProtocolModel;
 
 [StructLayout(LayoutKind.Auto)]
 [Immutable]
-internal readonly record struct NodeRuntime(int CommitIndex, int AppliedIndex, int VotesGranted, int ReadIndex, int ReadAcks, bool ReadReady, bool Stopping)
+internal readonly record struct NodeRuntime(
+    int CommitIndex,
+    int AppliedIndex,
+    int VotesGranted,
+    int ReadIndex,
+    int ReadAcks,
+    bool ReadReady,
+    bool Stopping,
+    int KnownLeaderTerm = 0,
+    int KnownLeaderId = -1)
 {
     internal static readonly NodeRuntime Initial = Create(0, 0, 0, 0, 0, false);
 

@@ -33,8 +33,8 @@ internal static class TransferFixtures
         .WithNodes(
         [
             new NodeState(LeaderId, NodeRole.Leader, SecondTerm, LeaderId, SingleEntryLog, NodeRuntime.Create(1, 1, 0b111, 0, 0, false), false),
-            new NodeState(FirstFollowerId, NodeRole.Follower, ElectedTerm, NoVote, SingleEntryLog, NodeRuntime.Create(1, 1, 0, 0, 0, false), false),
-            new NodeState(SecondFollowerId, NodeRole.Follower, SecondTerm, NoVote, SingleEntryLog, NodeRuntime.Create(1, 1, 0, 0, 0, false), false),
+            new NodeState(FirstFollowerId, NodeRole.Follower, ElectedTerm, NoVote, SingleEntryLog, LedBy(1, 1, 0, hintTerm, from), false),
+            new NodeState(SecondFollowerId, NodeRole.Follower, SecondTerm, NoVote, SingleEntryLog, LedBy(1, 1, 0, hintTerm, from), false),
         ])
         .WithMessages([new InFlightMessage(HintMessageId, MessagePayload.TransferHint(from, to, hintTerm))], HintMessageId + 1);
 
@@ -49,7 +49,7 @@ internal static class TransferFixtures
             .WithNodes(
             [
                 new NodeState(LeaderId, NodeRole.Leader, ElectedTerm, LeaderId, SingleEntryLog, NodeRuntime.Create(1, 1, 0b111, 0, 0, false), false),
-                new NodeState(FirstFollowerId, namedRole, ElectedTerm, votedFor, SingleEntryLog, NodeRuntime.Create(1, 1, votes, 0, 0, false), false),
+                new NodeState(FirstFollowerId, namedRole, ElectedTerm, votedFor, SingleEntryLog, LedBy(1, 1, votes, ElectedTerm, SecondFollowerId), false),
                 new NodeState(SecondFollowerId, NodeRole.Follower, ElectedTerm, NoVote, SingleEntryLog, NodeRuntime.Create(1, 1, 0, 0, 0, false), false),
             ])
             .WithMessages([new InFlightMessage(HintMessageId, MessagePayload.TransferHint(SecondFollowerId, FirstFollowerId, ElectedTerm))], HintMessageId + 1);
@@ -60,7 +60,7 @@ internal static class TransferFixtures
     internal static ClusterState HintToTheLeaderState() => ClusterState.CreateInitial(3)
         .WithNodes(
         [
-            new NodeState(LeaderId, NodeRole.Leader, ElectedTerm, LeaderId, SingleEntryLog, NodeRuntime.Create(1, 1, 0b111, 0, 0, false), false),
+            new NodeState(LeaderId, NodeRole.Leader, ElectedTerm, LeaderId, SingleEntryLog, LedBy(1, 1, 0b111, ElectedTerm, FirstFollowerId), false),
             new NodeState(FirstFollowerId, NodeRole.Follower, ElectedTerm, NoVote, SingleEntryLog, NodeRuntime.Create(1, 1, 0, 0, 0, false), false),
             new NodeState(SecondFollowerId, NodeRole.Follower, ElectedTerm, NoVote, SingleEntryLog, NodeRuntime.Create(1, 1, 0, 0, 0, false), false),
         ])
@@ -73,7 +73,7 @@ internal static class TransferFixtures
         [
             new NodeState(LeaderId, NodeRole.Follower, ElectedTerm, LeaderId, SingleEntryLog, NodeRuntime.Create(0, 0, 0, 0, 0, false), false),
             new NodeState(FirstFollowerId, NodeRole.Follower, ElectedTerm, NoVote, SingleEntryLog, NodeRuntime.Create(0, 0, 0, 0, 0, false), false),
-            new NodeState(SecondFollowerId, NodeRole.Follower, 0, NoVote, [], NodeRuntime.Create(0, 0, 0, 0, 0, false), true),
+            new NodeState(SecondFollowerId, NodeRole.Follower, 0, NoVote, [], LedBy(0, 0, 0, ElectedTerm, LeaderId), true),
         ])
         .WithMessages([new InFlightMessage(HintMessageId, MessagePayload.TransferHint(LeaderId, SecondFollowerId, ElectedTerm))], HintMessageId + 1);
 
@@ -94,6 +94,20 @@ internal static class TransferFixtures
         return count;
     }
 
+    /// <summary>Builds a runtime value for a member that has heard the given leader in the given term.</summary>
+    /// <param name="commitIndex">The commit index.</param>
+    /// <param name="appliedIndex">The applied index.</param>
+    /// <param name="votes">The votes granted.</param>
+    /// <param name="leaderTerm">The term the member heard a leader in.</param>
+    /// <param name="leaderId">The member it heard.</param>
+    /// <returns>The runtime value carrying that knowledge.</returns>
+    private static NodeRuntime LedBy(int commitIndex, int appliedIndex, int votes, int leaderTerm, int leaderId) =>
+        NodeRuntime.Create(commitIndex, appliedIndex, votes, 0, 0, false) with
+        {
+            KnownLeaderTerm = leaderTerm,
+            KnownLeaderId = leaderId,
+        };
+
     /// <summary>A cluster of three members whose leader holds one entry and voted for itself.</summary>
     /// <param name="hint">The hint in flight, or <see langword="null" />.</param>
     /// <returns>The state.</returns>
@@ -102,8 +116,8 @@ internal static class TransferFixtures
         var state = ClusterState.CreateInitial(3).WithNodes(
         [
             new NodeState(LeaderId, NodeRole.Leader, ElectedTerm, LeaderId, SingleEntryLog, NodeRuntime.Create(1, 1, 0b111, 0, 0, false), false),
-            new NodeState(FirstFollowerId, NodeRole.Follower, ElectedTerm, NoVote, SingleEntryLog, NodeRuntime.Create(1, 1, 0, 0, 0, false), false),
-            new NodeState(SecondFollowerId, NodeRole.Follower, ElectedTerm, NoVote, SingleEntryLog, NodeRuntime.Create(1, 1, 0, 0, 0, false), false),
+            new NodeState(FirstFollowerId, NodeRole.Follower, ElectedTerm, NoVote, SingleEntryLog, LedBy(1, 1, 0, ElectedTerm, LeaderId), false),
+            new NodeState(SecondFollowerId, NodeRole.Follower, ElectedTerm, NoVote, SingleEntryLog, LedBy(1, 1, 0, ElectedTerm, LeaderId), false),
         ]);
 
         return hint == null ? state : state.WithMessages([hint.Value], HintMessageId + 1);

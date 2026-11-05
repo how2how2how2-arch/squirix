@@ -109,19 +109,25 @@ internal static class ModelTransitionUtil
 
     internal static NodeState Patch(NodeState node, NodePatch patch)
     {
+        var runtime = NodeRuntime.Create(
+            patch.CommitIndex ?? node.CommitIndex,
+            patch.AppliedIndex ?? node.AppliedIndex,
+            patch.VotesGranted ?? node.VotesGranted,
+            patch.ReadIndex ?? node.ReadIndex,
+            patch.ReadAcks ?? node.ReadAcks,
+            patch.ReadReady ?? node.ReadReady,
+            patch.Stopping ?? node.Stopping) with
+        {
+            KnownLeaderTerm = patch.KnownLeaderTerm ?? node.KnownLeaderTerm,
+            KnownLeaderId = patch.KnownLeaderId ?? node.KnownLeaderId,
+        };
+
         return node.With(
             patch.Role ?? node.Role,
             patch.CurrentTerm ?? node.CurrentTerm,
             patch.VotedFor ?? node.VotedFor,
             patch.LogEntries ?? node.LogEntries,
-            NodeRuntime.Create(
-                patch.CommitIndex ?? node.CommitIndex,
-                patch.AppliedIndex ?? node.AppliedIndex,
-                patch.VotesGranted ?? node.VotesGranted,
-                patch.ReadIndex ?? node.ReadIndex,
-                patch.ReadAcks ?? node.ReadAcks,
-                patch.ReadReady ?? node.ReadReady,
-                patch.Stopping ?? node.Stopping),
+            in runtime,
             patch.Unseeded ?? node.Unseeded);
     }
 

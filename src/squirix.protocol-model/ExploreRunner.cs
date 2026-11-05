@@ -247,7 +247,8 @@ internal static class ExploreRunner
                                 + "-leader-completeness-all-leaders-commit-decision-history"
                                 + "-leader-contact-transfer-hint-serving-eligibility-retirement-keeps-its-vote"
                                 + "-hint-names-every-tied-successor-hint-reception-guards-emission-policy"
-                                + "-election-history-survives-retirement-retirement-closes-admission-until-restart";
+                                + "-election-history-survives-retirement-retirement-closes-admission-until-restart"
+                                + "-hint-attributed-to-the-leader-the-receiver-knows";
         var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(semantic));
         var sb = new StringBuilder(16);
         for (var i = 0; i < 8; i++)
@@ -1511,7 +1512,28 @@ internal static class ExploreRunner
 
                 var receiver = RefreshAppendReceiver(nodes, in msg);
                 var applied = ApplyAppendIfCurrent(in msg, nodes, receiver, profile);
+                RecordKnownLeader(nodes, in msg);
                 return EnqueueAppendResponse(state, in msg, scratch, profile, applied);
+            }
+
+            /// <summary>Records the sender as the leader of the message's term, when the receiver is in that term.</summary>
+            /// <param name="nodes">The nodes being patched.</param>
+            /// <param name="msg">The append-entries the receiver just took.</param>
+            /// <remarks>
+            /// A follower learns which member leads a term by taking an append-entries from it, and by nothing else: it
+            /// never sees the election, only the assertion. The record is taken even when the log check fails, because
+            /// the follower learned the sender's authority either way; a stale message, sent from a term the receiver has
+            /// already left, teaches nothing and is ignored.
+            /// </remarks>
+            private static void RecordKnownLeader(NodeState[] nodes, in InFlightMessage msg)
+            {
+                var receiver = nodes[msg.To];
+                if (msg.Term != receiver.CurrentTerm)
+                    return;
+
+                nodes[msg.To] = ModelTransitionUtil.Patch(
+                    receiver,
+                    new NodePatch { KnownLeaderTerm = msg.Term, KnownLeaderId = msg.From });
             }
 
             private static NodeState RefreshAppendReceiver(NodeState[] nodes, in InFlightMessage msg)
@@ -1713,6 +1735,12 @@ internal static class ExploreRunner
                 // The source has to be speaking for a term it has reached: a hint that names a term above its sender's
                 // own is not a handover from that term, whatever the receiver does with it.
                 if (delivered.Nodes[msg.From].CurrentTerm < msg.Term)
+                    return delivered;
+
+                // D3: the sender's own term says only that it has reached the term, not that it ever led it. A member that
+                // never led can still send a hint naming the term, so the receiver checks the name against the leader it
+                // has actually heard from: the address is only worth as much as the receiver's ability to attribute it.
+                if (receiver.KnownLeaderTerm != msg.Term || receiver.KnownLeaderId != msg.From)
                     return delivered;
 
                 // A hint names a successor, so it cannot name its sender, and a member already campaigning has started

@@ -22,6 +22,8 @@ internal sealed class NodeState
         ReadAcks = runtime.ReadAcks;
         ReadReady = runtime.ReadReady;
         Stopping = runtime.Stopping;
+        KnownLeaderTerm = runtime.KnownLeaderTerm;
+        KnownLeaderId = runtime.KnownLeaderId;
     }
 
     internal int AppliedIndex { get; }
@@ -59,6 +61,18 @@ internal sealed class NodeState
     /// process without any disk loss.
     /// </remarks>
     internal bool Stopping { get; }
+
+    /// <summary>Gets the term in which this member last accepted an append-entries, or 0 when it has accepted none.</summary>
+    /// <remarks>
+    /// Volatile, like <see cref="Stopping" />: it is what this copy remembers, not what the cluster agreed, so it lives
+    /// with the process. A receiver learns the leader of a term by taking an append-entries from it, which is the only
+    /// evidence of leadership a follower has, and it is what makes a transfer hint attributable: the hint names a
+    /// sender, and the receiver can only check that name against a leader it has actually heard from.
+    /// </remarks>
+    internal int KnownLeaderTerm { get; }
+
+    /// <summary>Gets the member this copy knows as the leader of <see cref="KnownLeaderTerm" />, or -1 when it knows none.</summary>
+    internal int KnownLeaderId { get; }
 
     /// <summary>Gets a value indicating whether the copy lost its disk: it votes for nobody, takes no entries and never campaigns until repaired.</summary>
     internal bool Unseeded { get; }

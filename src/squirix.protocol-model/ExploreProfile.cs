@@ -120,11 +120,11 @@ internal sealed class ExploreProfile
 
     /// <summary>Builds the small disk-loss profile: three replicas, two terms, one entry.</summary>
     /// <returns>The profile.</returns>
-    internal static ExploreProfile SmallDiskLoss() => ForDiskLoss(3, 2, 2, 300_000);
+    internal static ExploreProfile SmallDiskLoss() => ForDiskLoss(3, 2, 2, 2_000_000);
 
     /// <summary>Builds the small log-rules profile: three terms, two entries, one message in flight; it reaches its fixed point.</summary>
     /// <returns>The profile.</returns>
-    internal static ExploreProfile SmallLogRules() => ForLogRules(3, 2, 1, 300_000);
+    internal static ExploreProfile SmallLogRules() => ForLogRules(3, 2, 1, 2_000_000);
 
     /// <summary>Builds the log-rules profile that reaches the loss of an earlier-term entry: four terms, two entries, one message in flight.</summary>
     /// <returns>The profile.</returns>

@@ -247,6 +247,8 @@ internal sealed class ClusterState
             sb.Append(',');
             sb.AppendFlag(n.Unseeded);
             sb.Append(',');
+            AppendField(sb, n.KnownLeaderTerm);
+            AppendField(sb, identity.KnownLeaderId);
             sb.Append('[');
             AppendLog(sb, n);
             sb.Append(']');
@@ -261,12 +263,16 @@ internal sealed class ClusterState
                 var n = nodes[source];
                 if (map.IsEmpty)
                 {
-                    AppendNode(sb, n, new NodeIdentity(n.Id, n.VotedFor, n.VotesGranted, n.ReadAcks));
+                    AppendNode(sb, n, new NodeIdentity(n.Id, n.VotedFor, n.VotesGranted, n.ReadAcks, n.KnownLeaderId));
                 }
                 else
                 {
                     var votedFor = n.VotedFor < 0 ? -1 : map[n.VotedFor];
-                    AppendNode(sb, n, new NodeIdentity(i, votedFor, VoteMask.Remap(n.VotesGranted, map), VoteMask.Remap(n.ReadAcks, map)));
+                    var knownLeader = n.KnownLeaderId < 0 ? -1 : map[n.KnownLeaderId];
+                    AppendNode(
+                        sb,
+                        n,
+                        new NodeIdentity(i, votedFor, VoteMask.Remap(n.VotesGranted, map), VoteMask.Remap(n.ReadAcks, map), knownLeader));
                 }
 
                 sb.Append('|');
@@ -457,7 +463,7 @@ internal sealed class ClusterState
 
         [StructLayout(LayoutKind.Auto)]
         [Immutable]
-        private readonly record struct NodeIdentity(int Id, int VotedFor, int VotesGranted, int ReadAcks);
+        private readonly record struct NodeIdentity(int Id, int VotedFor, int VotesGranted, int ReadAcks, int KnownLeaderId);
 
         /// <summary>Orders nodes by their label-free fields; nodes equal in every field keep their original order.</summary>
         [Immutable]
@@ -529,8 +535,26 @@ internal sealed class ClusterState
                     return c;
 
                 c = a.Stopping.CompareTo(b.Stopping);
+                if (c != 0)
+                    return c;
+
+                c = a.KnownLeaderTerm.CompareTo(b.KnownLeaderTerm);
+                if (c != 0)
+                    return c;
+
+                c = KnownLeaderRelation(a).CompareTo(KnownLeaderRelation(b));
                 return c != 0 ? c : a.Unseeded.CompareTo(b.Unseeded);
             }
+
+            /// <summary>Classifies a node's known leader against its own label, so the ordering never reads an id.</summary>
+            /// <param name="node">The node.</param>
+            /// <returns>-1 for no known leader, 0 for itself, 1 for another member.</returns>
+            private static int KnownLeaderRelation(NodeState node) => (node.KnownLeaderId < 0, node.KnownLeaderId == node.Id) switch
+            {
+                (true, _) => -1,
+                (false, true) => 0,
+                (false, false) => 1,
+            };
 
             private static int CompareTermState(NodeState a, NodeState b)
             {

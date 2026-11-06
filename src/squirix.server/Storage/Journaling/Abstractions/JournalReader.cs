@@ -39,8 +39,37 @@ internal static class JournalReader
         if (!Directory.Exists(dataDir) || !TryGetJournalFiles(dataDir, out var files) || files.Length == 0)
             return [];
 
-        Array.Sort(files, StringComparer.Ordinal);
-        return CollectSegments(files, fromSegment);
+        var segments = CollectSegments(files, fromSegment);
+        Array.Sort(segments, static (left, right) =>
+        {
+            var byIndex = left.Index.CompareTo(right.Index);
+            return byIndex != 0 ? byIndex : string.CompareOrdinal(left.Path, right.Path);
+        });
+        return segments;
+    }
+
+    /// <summary>Returns the lowest and highest valid segment indexes.</summary>
+    /// <param name="dataDir">The journal directory.</param>
+    /// <returns>The boundary indexes, or zeros when no valid segment is found.</returns>
+    internal static (int FirstAvailableSegment, int LastAvailableSegment) GetSegmentRange(string dataDir)
+    {
+        if (!Directory.Exists(dataDir) || !TryGetJournalFiles(dataDir, out var files))
+            return default;
+
+        var firstIndex = 0;
+        var lastIndex = 0;
+        foreach (var path in files)
+        {
+            if (!TryParseJournalSegmentIndex(Path.GetFileName(path.AsSpan()), out var index) || index < 1)
+                continue;
+
+            if (firstIndex == 0 || index < firstIndex)
+                firstIndex = index;
+            if (index > lastIndex)
+                lastIndex = index;
+        }
+
+        return (firstIndex, lastIndex);
     }
 
     /// <summary>Lists paths of positive journal segments strictly below the replay floor, without sorting them.</summary>
@@ -88,7 +117,7 @@ internal static class JournalReader
         for (var i = 0; i < files.Length; i++)
         {
             var path = files[i];
-            if (!TryParseJournalSegment(path, 1, out _))
+            if (!TryParseJournalSegmentIndex(Path.GetFileName(path).AsSpan(), out var index) || index < 1)
                 continue;
 
             segmentCount++;

@@ -110,7 +110,7 @@ internal static class ExploreRunner
 
         if (aggregate.FirstPolicy != null && aggregate.FirstPolicyState != null)
         {
-            var policyFileName = "policy-" + aggregate.FirstPolicy.Policy + ".json";
+            var policyFileName = ProtocolPolicyChecker.PolicyReportFileName(aggregate.FirstPolicy.Policy);
             RemoveObsoletePolicyReports(outputDir, policyFileName);
             var policyJson = ProtocolPolicyChecker.FormatCounterexampleJson(aggregate.FirstPolicy, aggregate.FirstPolicyState, FindPolicyPath(results, aggregate.FirstPolicy));
             await File.WriteAllTextAsync(Path.Join(outputDir, policyFileName), policyJson, Encoding.UTF8, CancellationToken.None).ConfigureAwait(false);
@@ -140,17 +140,25 @@ internal static class ExploreRunner
     /// <param name="outputDir">The output directory, which a caller may reuse across runs.</param>
     /// <param name="keepFileName">The report this run writes, or <see langword="null" /> when it writes none.</param>
     /// <remarks>
-    /// Every <c lang="text">policy-*.json</c> in the directory was generated, so one this run did not just produce is obsolete. The name
-    /// of the written report is chosen per policy, so deleting a single fixed name left the previous run's report in place
-    /// while the summary beside it said <c lang="json">"policyViolation":null</c> — an artifact set describing a run that did not happen.
-    /// Only generated policy reports are removed here; the safety counterexample is judged by its own field.
+    /// The names removed here come from <see cref="ProtocolPolicyChecker.PolicyNames" />, so the set this method may delete is
+    /// exactly the set the CLI can write. The name of the written report is chosen per policy, so deleting a single fixed name
+    /// left the previous run's report in place while the summary beside it said <c lang="json">"policyViolation":null</c> — an
+    /// artifact set describing a run that did not happen. Matching <c lang="text">policy-*.json</c> instead also matched files
+    /// this program never writes: a caller's own <c lang="text">policy-user-notes.json</c> was deleted by a run that produced
+    /// no report at all. Only names this checker can report are ours; anything else in the directory belongs to the caller.
     /// </remarks>
     private static void RemoveObsoletePolicyReports(string outputDir, string? keepFileName)
     {
-        foreach (var existing in Directory.EnumerateFiles(outputDir, "policy-*.json"))
+        var names = ProtocolPolicyChecker.PolicyNames;
+        for (var i = 0; i < names.Count; i++)
         {
-            if (!string.Equals(Path.GetFileName(existing), keepFileName, StringComparison.Ordinal))
-                File.Delete(existing);
+            var generated = ProtocolPolicyChecker.PolicyReportFileName(names[i]);
+            if (string.Equals(generated, keepFileName, StringComparison.Ordinal))
+                continue;
+
+            var path = Path.Join(outputDir, generated);
+            if (File.Exists(path))
+                File.Delete(path);
         }
     }
 

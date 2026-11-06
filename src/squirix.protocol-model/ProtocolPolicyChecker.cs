@@ -20,6 +20,19 @@ internal static class ProtocolPolicyChecker
     /// <summary>The policy that a hint names exactly one successor, so a retirement cannot put two hints from one term in flight.</summary>
     internal const string HintNamesOneSuccessor = "TransferHintNamesOneSuccessor";
 
+    /// <summary>Gets every rule this checker can report, which is every policy report the CLI can write.</summary>
+    /// <remarks>
+    /// A report is named after the rule it carries, so this set is exactly the set of report names the CLI can produce.
+    /// A consumer that has to recognise its own reports reads the names from here instead of matching a pattern, because
+    /// a pattern also matches files this program did not write.
+    /// </remarks>
+    internal static IReadOnlyList<string> PolicyNames { get; } = [HintSourceRetired, HintNamesOneSuccessor];
+
+    /// <summary>Returns the report file name that carries one rule's counterexample.</summary>
+    /// <param name="policy">The rule name, one of <see cref="PolicyNames" />.</param>
+    /// <returns>The file name, with no directory part.</returns>
+    internal static string PolicyReportFileName(string policy) => "policy-" + policy + ".json";
+
     /// <summary>Returns the first policy the state breaks, or <see langword="null" /> when it breaks none.</summary>
     /// <param name="state">The state to check.</param>
     /// <returns>The violation, with the event that produced it.</returns>

@@ -23,7 +23,7 @@ public sealed class LeaderCompletenessTraceTests
         state = Pick(state, static s => s.Nodes[0].LastLogIndex == 2, "append A's second entry");
         state = DropAll(state);
         state = Pick(state, static s => s.Nodes[1].Role == NodeRole.Leader && s.Nodes[1].CurrentTerm == 2, "B wins term two with C");
-        state = Pick(state, static s => s.Messages.Count == 1 && s.Messages[0].To == 2 && s.Nodes[0].LastLogIndex == 2, "drop B's append to A");
+        state = Pick(state, static s => s.Messages is [{ To: 2 }] && s.Nodes[0].LastLogIndex == 2, "drop B's append to A");
         state = Pick(state, static s => s.Nodes[2].LastLogTerm == 2 && s.Messages.Count == 1, "C stores B's entry");
         state = Pick(state, static s => s.Nodes[1].CommitIndex == 1, "B commits term two entry");
         state = DropAll(state);
@@ -43,6 +43,7 @@ public sealed class LeaderCompletenessTraceTests
         _ = await Assert.That(state.Nodes[1].LogEntries[0].Term).IsEqualTo(2);
         _ = await Assert.That(state.Nodes[0].LogEntries[0].Term).IsEqualTo(1);
         _ = await Assert.That(SafetyChecker.Check(state)?.Invariant).IsEqualTo("LeaderCompleteness");
+        return;
 
         ClusterState Pick(ClusterState before, Func<ClusterState, bool> predicate, string step)
         {
@@ -57,18 +58,6 @@ public sealed class LeaderCompletenessTraceTests
 
             return current;
         }
-    }
-
-    private static ClusterState SelectDrop(ClusterState before, ExploreProfile profile)
-    {
-        var successors = ExploreRunner.NextStates(before, profile, BrokenMode.LogOrder);
-        for (var i = 0; i < successors.Count; i++)
-        {
-            if (successors[i].Messages.Count == before.Messages.Count - 1 && SameNodes(before, successors[i]))
-                return successors[i];
-        }
-
-        throw new InvalidOperationException("No actual drop transition");
     }
 
     private static bool SameNodes(ClusterState before, ClusterState after)
@@ -95,5 +84,17 @@ public sealed class LeaderCompletenessTraceTests
         }
 
         throw new InvalidOperationException("No actual transition for " + step);
+    }
+
+    private static ClusterState SelectDrop(ClusterState before, ExploreProfile profile)
+    {
+        var successors = ExploreRunner.NextStates(before, profile, BrokenMode.LogOrder);
+        for (var i = 0; i < successors.Count; i++)
+        {
+            if (successors[i].Messages.Count == before.Messages.Count - 1 && SameNodes(before, successors[i]))
+                return successors[i];
+        }
+
+        throw new InvalidOperationException("No actual drop transition");
     }
 }

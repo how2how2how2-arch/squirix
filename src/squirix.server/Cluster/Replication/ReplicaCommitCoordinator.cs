@@ -159,7 +159,7 @@ internal sealed class ReplicaCommitCoordinator : IAsyncDisposable
     /// <summary>Gets or initializes the time source bounding the first wait of background follower observation.</summary>
     internal required TimeProvider ObserveTimeProvider { get; init; }
 
-    /// <summary>Initializes the longest dispose wait for owned work to make progress before it is abandoned; 5 seconds unless set.</summary>
+    /// <summary>Initializes the total dispose wait for owned work before it is abandoned; 5 seconds unless set.</summary>
     /// <exception cref="ArgumentOutOfRangeException">The budget is not positive.</exception>
     internal TimeSpan ShutdownBudget
     {
@@ -391,6 +391,8 @@ internal sealed class ReplicaCommitCoordinator : IAsyncDisposable
 
     private async Task DisposeCoreAsync()
     {
+        // Use the system clock so shutdown also ends when the observation clock is paused.
+        using var budget = new CancellationTokenSource(ShutdownBudget);
         try
         {
             // Bounded drain so disposal completes even when a follower task never finishes
@@ -407,23 +409,7 @@ internal sealed class ReplicaCommitCoordinator : IAsyncDisposable
                     _ownedTasks.Clear();
                 }
 
-                while (tasks.Count > 0)
-                {
-                    Task completed;
-                    try
-                    {
-                        // Always the system clock, not ObserveTimeProvider: a test clock nobody advances would park disposal forever
-                        // behind a follower that never finishes, and the budget exists to bound exactly that wait.
-                        completed = await ReplicaFollowerObservation.TakeNextCompletedAsync(tasks, ShutdownBudget, TimeProvider.System, AbandonedWorkFaultReporter)
-                                                                    .ConfigureAwait(false);
-                    }
-                    catch (TimeoutException)
-                    {
-                        break;
-                    }
-
-                    _ = completed.Exception;
-                }
+                await ReplicaFollowerObservation.DrainOwnedAsync(tasks, AbandonedWorkFaultReporter, budget.Token).ConfigureAwait(false);
             }
         }
         finally
@@ -550,8 +536,8 @@ internal sealed class ReplicaCommitCoordinator : IAsyncDisposable
     private sealed class ReplicaLogTurn
     {
         private readonly Lock _sync = new();
+        private readonly Dictionary<ulong, (TaskCompletionSource Ready, int Count)> _waiters = [];
         private ulong _nextLogIndex;
-        private TaskCompletionSource<bool> _turnAdvanced = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         internal ReplicaLogTurn(ulong lastLogIndex)
         {
@@ -564,37 +550,79 @@ internal sealed class ReplicaCommitCoordinator : IAsyncDisposable
         internal void Advance(ulong logIndex, int count = 1)
         {
             ArgumentOutOfRangeException.ThrowIfLessThan(count, 1);
-            TaskCompletionSource<bool> completed;
             lock (_sync)
             {
                 if (logIndex != _nextLogIndex)
                     throw new InvalidOperationException("The durable append completed outside the expected group log order.");
 
                 _nextLogIndex += ulong.CreateChecked(count);
-                completed = _turnAdvanced;
-                _turnAdvanced = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-            }
+                if (_waiters.Count == 0)
+                    return;
 
-            _ = completed.TrySetResult(true);
+                for (var index = logIndex + 1; index < _nextLogIndex && _waiters.Count > 0; index++)
+                    Signal(index);
+
+                Signal(_nextLogIndex);
+            }
         }
 
         internal async ValueTask WaitAsync(ulong logIndex, CancellationToken cancellationToken)
         {
-            while (true)
+            TaskCompletionSource ready;
+            lock (_sync)
             {
-                Task turnAdvanced;
-                lock (_sync)
+                ThrowIfPassed(logIndex);
+                if (logIndex == _nextLogIndex)
+                    return;
+
+                if (_waiters.TryGetValue(logIndex, out var waiter))
                 {
-                    if (logIndex < _nextLogIndex)
-                        throw new InvalidOperationException("Prepared mutation is behind the next group log index.");
-                    if (logIndex == _nextLogIndex)
-                        return;
-
-                    turnAdvanced = _turnAdvanced.Task;
+                    ready = waiter.Ready;
+                    _waiters[logIndex] = (ready, waiter.Count + 1);
                 }
-
-                await turnAdvanced.WaitAsync(cancellationToken).ConfigureAwait(false);
+                else
+                {
+                    ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    _waiters.Add(logIndex, (ready, 1));
+                }
             }
+
+            try
+            {
+                await ready.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+                lock (_sync)
+                    ThrowIfPassed(logIndex);
+            }
+            finally
+            {
+                RemoveWaiter(logIndex, ready);
+            }
+        }
+
+        private void RemoveWaiter(ulong logIndex, TaskCompletionSource ready)
+        {
+            lock (_sync)
+            {
+                if (!_waiters.TryGetValue(logIndex, out var waiter) || waiter.Ready != ready)
+                    return;
+
+                if (waiter.Count == 1)
+                    _ = _waiters.Remove(logIndex);
+                else
+                    _waiters[logIndex] = (ready, waiter.Count - 1);
+            }
+        }
+
+        private void Signal(ulong logIndex)
+        {
+            if (_waiters.Remove(logIndex, out var waiter))
+                _ = waiter.Ready.TrySetResult();
+        }
+
+        private void ThrowIfPassed(ulong logIndex)
+        {
+            if (logIndex < _nextLogIndex)
+                throw new InvalidOperationException("Prepared mutation is behind the next group log index.");
         }
     }
 }

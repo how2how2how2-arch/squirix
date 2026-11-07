@@ -16,6 +16,7 @@ internal static class ExploreRunner
     private const int ExitBrokenWithoutViolation = 3;
     private const int ExitBudgetExhausted = 4;
 
+    private const int ExitPolicyViolation = 5;
     private const int ExitSuccess = 0;
     private const int ExitViolation = 2;
 
@@ -64,13 +65,60 @@ internal static class ExploreRunner
 
     internal static ExploreResult Run(ExploreProfile profile, BrokenMode broken) => StateExplorer.Explore(profile, broken);
 
+    /// <summary>Returns every state the profile reaches, in the order it was reached, without stopping on a violation.</summary>
+    /// <param name="profile">The profile.</param>
+    /// <param name="broken">The injected fault.</param>
+    /// <returns>The reachable states, one per distinct fingerprint of the profile.</returns>
+    /// <remarks>
+    /// The exploration a run reports only counts states, so it cannot answer whether two ways of exploring the same
+    /// profile reach the same behaviour. This is what that comparison is made of: the states themselves, deduplicated by
+    /// the profile's own fingerprint, so a caller can canonicalise them and compare sets.
+    /// </remarks>
+    internal static List<ClusterState> ReachableStates(ExploreProfile profile, BrokenMode broken)
+    {
+        ArgumentNullException.ThrowIfNull(profile);
+        var output = new List<ClusterState>();
+        var seen = new HashSet<string>(StringComparer.Ordinal) { ClusterState.CreateInitial(profile.ReplicaCount).Fingerprint(profile.SymmetryReduce) };
+        var queue = new Queue<ClusterState>();
+        var initial = ClusterState.CreateInitial(profile.ReplicaCount);
+        queue.Enqueue(initial);
+        output.Add(initial);
+        while (queue.Count > 0)
+        {
+            var current = queue.Dequeue();
+            var successors = NextStates(current, profile, broken);
+            for (var i = 0; i < successors.Count; i++)
+            {
+                if (!seen.Add(successors[i].Fingerprint(profile.SymmetryReduce)))
+                    continue;
+
+                output.Add(successors[i]);
+                queue.Enqueue(successors[i]);
+            }
+        }
+
+        return output;
+    }
+
     internal static async Task<int> RunCliAsync(string profileName, string outputDir, BrokenMode broken)
     {
         _ = Directory.CreateDirectory(outputDir);
         var results = CollectResults(profileName, broken);
         var aggregate = AggregateResults(results);
-        var summary = new SummaryContent(profileName, broken, aggregate.TotalStates, aggregate.TotalTransitions, aggregate.FirstViolation, aggregate.AllFixedPoint);
+        var summary = new SummaryContent(profileName, broken, aggregate.TotalStates, aggregate.TotalTransitions, aggregate.FirstViolation, aggregate.FirstPolicy, aggregate.AllFixedPoint);
         await WriteSummaryAsync(outputDir, in summary, CancellationToken.None).ConfigureAwait(false);
+
+        if (aggregate.FirstPolicy != null && aggregate.FirstPolicyState != null)
+        {
+            var policyFileName = ProtocolPolicyChecker.PolicyReportFileName(aggregate.FirstPolicy.Policy);
+            RemoveObsoletePolicyReports(outputDir, policyFileName);
+            var policyJson = ProtocolPolicyChecker.FormatCounterexampleJson(aggregate.FirstPolicy, aggregate.FirstPolicyState, FindPolicyPath(results, aggregate.FirstPolicy));
+            await File.WriteAllTextAsync(Path.Join(outputDir, policyFileName), policyJson, Encoding.UTF8, CancellationToken.None).ConfigureAwait(false);
+        }
+        else
+        {
+            RemoveObsoletePolicyReports(outputDir, null);
+        }
 
         if (aggregate.FirstViolation == null || aggregate.FirstState == null)
         {
@@ -78,14 +126,40 @@ internal static class ExploreRunner
             if (File.Exists(staleCounterexample))
                 File.Delete(staleCounterexample);
 
-            return ExitCode(broken, aggregate.FirstViolation, aggregate.AllFixedPoint);
+            return ExitCode(broken, aggregate.FirstViolation, aggregate.FirstPolicy, aggregate.AllFixedPoint);
         }
 
         var path = FindPath(results, aggregate.FirstViolation);
         var json = SafetyChecker.FormatCounterexampleJson(aggregate.FirstViolation, aggregate.FirstState, path);
         await File.WriteAllTextAsync(Path.Join(outputDir, "counterexample.json"), json, Encoding.UTF8, CancellationToken.None).ConfigureAwait(false);
 
-        return ExitCode(broken, aggregate.FirstViolation, aggregate.AllFixedPoint);
+        return ExitCode(broken, aggregate.FirstViolation, aggregate.FirstPolicy, aggregate.AllFixedPoint);
+    }
+
+    /// <summary>Removes the generated policy reports that the current run did not produce.</summary>
+    /// <param name="outputDir">The output directory, which a caller may reuse across runs.</param>
+    /// <param name="keepFileName">The report this run writes, or <see langword="null" /> when it writes none.</param>
+    /// <remarks>
+    /// The names removed here come from <see cref="ProtocolPolicyChecker.PolicyNames" />, so the set this method may delete is
+    /// exactly the set the CLI can write. The name of the written report is chosen per policy, so deleting a single fixed name
+    /// left the previous run's report in place while the summary beside it said <c lang="json">"policyViolation":null</c> — an
+    /// artifact set describing a run that did not happen. Matching <c lang="text">policy-*.json</c> instead also matched files
+    /// this program never writes: a caller's own <c lang="text">policy-user-notes.json</c> was deleted by a run that produced
+    /// no report at all. Only names this checker can report are ours; anything else in the directory belongs to the caller.
+    /// </remarks>
+    private static void RemoveObsoletePolicyReports(string outputDir, string? keepFileName)
+    {
+        var names = ProtocolPolicyChecker.PolicyNames;
+        for (var i = 0; i < names.Count; i++)
+        {
+            var generated = ProtocolPolicyChecker.PolicyReportFileName(names[i]);
+            if (string.Equals(generated, keepFileName, StringComparison.Ordinal))
+                continue;
+
+            var path = Path.Join(outputDir, generated);
+            if (File.Exists(path))
+                File.Delete(path);
+        }
     }
 
     private static int AdvanceTrace(ClusterState? previous, ClusterState state, IReadOnlyList<ModelCommitTracePoint> trace, int traceIndex)
@@ -106,6 +180,8 @@ internal static class ExploreRunner
     {
         SafetyViolation? firstViolation = null;
         ClusterState? firstState = null;
+        PolicyViolation? firstPolicy = null;
+        ClusterState? firstPolicyState = null;
         var totalStates = 0;
         var totalTransitions = 0;
         var allFixedPoint = true;
@@ -116,13 +192,19 @@ internal static class ExploreRunner
             if (!results[i].Result.FixedPointReached && results[i].Result.Violation == null)
                 allFixedPoint = false;
 
+            if (firstPolicy == null && results[i].Result.PolicyViolation != null)
+            {
+                firstPolicy = results[i].Result.PolicyViolation;
+                firstPolicyState = results[i].Result.PolicyViolatingState;
+            }
+
             if (firstViolation != null || results[i].Result.Violation == null)
                 continue;
             firstViolation = results[i].Result.Violation;
             firstState = results[i].Result.ViolatingState;
         }
 
-        return new ResultAggregate(totalStates, totalTransitions, firstViolation, firstState, allFixedPoint);
+        return new ResultAggregate(totalStates, totalTransitions, firstViolation, firstState, firstPolicy, firstPolicyState, allFixedPoint);
     }
 
     private static void CollectFullProfiles(BrokenMode broken, List<(ExploreProfile Profile, ExploreResult Result)> results)
@@ -170,7 +252,11 @@ internal static class ExploreRunner
         const string semantic = "squirix-protocol-model-v2-raft-safety-match-entry-aware-commit-json-disk-loss-repair-ceiling-log-matching-"
                                 + "log-rules-state-commit-rule-log-order-higher-term-replies"
                                 + "-commit-by-own-rule-only-any-commit-index-committed"
-                                + "-leader-completeness-all-leaders-commit-decision-history";
+                                + "-leader-completeness-all-leaders-commit-decision-history"
+                                + "-leader-contact-transfer-hint-serving-eligibility-retirement-keeps-its-vote"
+                                + "-hint-names-every-tied-successor-hint-reception-guards-emission-policy"
+                                + "-election-history-survives-retirement-retirement-closes-admission-until-restart"
+                                + "-hint-attributed-to-the-leader-the-receiver-knows";
         var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(semantic));
         var sb = new StringBuilder(16);
         for (var i = 0; i < 8; i++)
@@ -179,17 +265,34 @@ internal static class ExploreRunner
         return sb.ToString();
     }
 
-    private static int ExitCode(BrokenMode broken, SafetyViolation? firstViolation, bool allFixedPoint)
+    private static int ExitCode(BrokenMode broken, SafetyViolation? firstViolation, PolicyViolation? firstPolicy, bool allFixedPoint)
     {
-        // Success = clean exhaustion or the injected break manifesting; 3 = injected break stayed silent; 4 = hit documented MaxStates (residual risk, not a counterexample).
-        return (broken != BrokenMode.None, firstViolation != null, allFixedPoint) switch
+        // Success = clean exhaustion or the injected break manifesting; 2 = data-safety violation; 3 = injected break stayed
+        // silent; 4 = hit documented MaxStates (residual risk, not a counterexample); 5 = a step the protocol does not allow,
+        // which is not a data loss and is therefore its own code.
+        var found = firstViolation != null || firstPolicy != null;
+        return (broken != BrokenMode.None, found, firstViolation != null, allFixedPoint) switch
         {
-            (true, true, _) => ExitSuccess,
-            (true, false, _) => ExitBrokenWithoutViolation,
-            (false, true, _) => ExitViolation,
-            (false, false, true) => ExitSuccess,
-            (false, false, false) => ExitBudgetExhausted,
+            (true, true, _, _) => ExitSuccess,
+            (true, false, _, _) => ExitBrokenWithoutViolation,
+            (false, true, true, _) => ExitViolation,
+            (false, true, false, _) => ExitPolicyViolation,
+            (false, false, _, true) => ExitSuccess,
+            (false, false, _, false) => ExitBudgetExhausted,
         };
+    }
+
+    private static IReadOnlyList<string>? FindPolicyPath(List<(ExploreProfile Profile, ExploreResult Result)> results, PolicyViolation policy)
+    {
+        for (var i = 0; i < results.Count; i++)
+        {
+            var result = results[i].Result;
+            if (result.PolicyViolation != null && string.Equals(result.PolicyViolation.Policy, policy.Policy, StringComparison.Ordinal) &&
+                string.Equals(result.PolicyViolation.StateFingerprint, policy.StateFingerprint, StringComparison.Ordinal))
+                return result.CounterexamplePaths;
+        }
+
+        return null;
     }
 
     private static IReadOnlyList<string>? FindPath(List<(ExploreProfile Profile, ExploreResult Result)> results, SafetyViolation violation)
@@ -217,6 +320,8 @@ internal static class ExploreRunner
             BrokenMode.ReadIndex => "ReadIndex",
             BrokenMode.RepairCeiling => "RepairCeiling",
             BrokenMode.LogOrder => "LogOrder",
+            BrokenMode.TransferHint => "TransferHint",
+            BrokenMode.TransferHintStaleAccept => "TransferHintStaleAccept",
             _ => throw new ArgumentOutOfRangeException(nameof(broken), broken, "Unsupported enum value."),
         };
     }
@@ -323,16 +428,46 @@ internal static class ExploreRunner
             _ = sb.Append('}');
         }
 
+        _ = sb.Append(",\"policyViolation\":");
+        if (content.Policy == null)
+        {
+            _ = sb.Append("null");
+        }
+        else
+        {
+            _ = sb.Append('{').Append("\"policy\":");
+            JsonText.AppendString(sb, content.Policy.Policy);
+            _ = sb.Append(",\"detail\":");
+            JsonText.AppendString(sb, content.Policy.Detail);
+            _ = sb.Append(",\"event\":");
+            JsonText.AppendString(sb, content.Policy.EventTrace);
+            _ = sb.Append('}');
+        }
+
         _ = sb.Append('}');
         return File.WriteAllTextAsync(Path.Join(outputDir, "summary.json"), sb.ToString(), Encoding.UTF8, cancellationToken);
     }
 
     [Immutable]
-    private readonly record struct ResultAggregate(int TotalStates, int TotalTransitions, SafetyViolation? FirstViolation, ClusterState? FirstState, bool AllFixedPoint);
+    private readonly record struct ResultAggregate(
+        int TotalStates,
+        int TotalTransitions,
+        SafetyViolation? FirstViolation,
+        ClusterState? FirstState,
+        PolicyViolation? FirstPolicy,
+        ClusterState? FirstPolicyState,
+        bool AllFixedPoint);
 
     [Immutable]
     [StructLayout(LayoutKind.Auto)]
-    private readonly record struct SummaryContent(string ProfileName, BrokenMode Broken, int States, int Transitions, SafetyViolation? Violation, bool FixedPointReached);
+    private readonly record struct SummaryContent(
+        string ProfileName,
+        BrokenMode Broken,
+        int States,
+        int Transitions,
+        SafetyViolation? Violation,
+        PolicyViolation? Policy,
+        bool FixedPointReached);
 
     [Immutable]
     [StructLayout(LayoutKind.Auto)]
@@ -347,6 +482,12 @@ internal static class ExploreRunner
                 ModelAtomicElections.Collect(state, profile, broken, output);
             else
                 CollectElections(state, profile, output);
+
+            // The transfer hint belongs to the message-driven profiles: a hint delivered there becomes a campaign the
+            // vote exchange then decides, which is the rule the log-rules profiles fold into one step.
+            if (profile.LeaderTransfer)
+                ModelTransfers.Collect(state, profile, broken, output);
+
             CollectClientProposals(state, profile, output);
             CollectReadIndexes(state, profile, broken, output);
             CollectDeliveries(state, profile, broken, output);
@@ -502,7 +643,7 @@ internal static class ExploreRunner
         {
             for (var i = 0; i < state.Nodes.Count; i++)
             {
-                if (!TryBuildElection(state, profile, i, out var next))
+                if (!TryBuildElection(state, profile, i, false, out var next))
                     continue;
 
                 output.Add(next);
@@ -595,11 +736,24 @@ internal static class ExploreRunner
             return true;
         }
 
-        private static bool TryBuildElection(ClusterState state, ExploreProfile profile, int candidateId, out ClusterState next)
+        private static bool TryBuildElection(ClusterState state, ExploreProfile profile, int candidateId, bool authorisedAfterLeaderContact, out ClusterState next)
         {
             next = state;
             var node = state.Nodes[candidateId];
             if (node.Role is NodeRole.Leader || node.Unseeded)
+                return false;
+
+            // A retired member has closed its admission for this process lifecycle, so it does not campaign again even
+            // though it is now an ordinary follower. Losing the hint it sent must not hand the leadership back: D1 keeps
+            // admission closed until the process restarts. Two transitions restart one here: a collected crash rebuilds
+            // the runtime value from durable state, and losing the disk plus the repair that follows it clears it too.
+            if (node.Stopping)
+                return false;
+
+            // Leader contact: a member that hears a live leader keeps resetting its election timer, so it does not
+            // campaign. A transfer hint is the only thing that names a member to campaign anyway, and it confers
+            // nothing beyond that: the votes are the ones it would collect at any other moment.
+            if (!authorisedAfterLeaderContact && profile.LeaderTransfer && ModelTransfers.HearsLiveLeader(state, candidateId))
                 return false;
 
             var nextTerm = node.CurrentTerm + 1;
@@ -677,6 +831,10 @@ internal static class ExploreRunner
                     var candidate = state.Nodes[candidateId];
                     var term = candidate.CurrentTerm + 1;
                     if (candidate.Role is NodeRole.Leader || candidate.Unseeded || term > profile.MaxTerm)
+                        continue;
+
+                    // The same leader-contact rule as a message-driven campaign: an election is one step here, not two rules.
+                    if (profile.LeaderTransfer && ModelTransfers.HearsLiveLeader(state, candidateId))
                         continue;
 
                     output.Add(Lose(state, candidateId, term));
@@ -765,6 +923,169 @@ internal static class ExploreRunner
         /// it, an entry of an earlier term included, as the catch-up of the product does. It lets an earlier-term entry reach a majority in a
         /// later term.
         /// </remarks>
+        /// <summary>
+        /// The leadership a retiring leader hands on: it steps down and names one successor to campaign now, and no other
+        /// transition produces a hint.
+        /// </summary>
+        [Immutable]
+        private static class ModelTransfers
+        {
+            internal static void Collect(ClusterState state, ExploreProfile profile, BrokenMode broken, List<ClusterState> output)
+            {
+                CollectRetirements(state, profile, output);
+                CollectUnretiredHints(state, profile, broken, output);
+            }
+
+            /// <summary>Decides whether a member hears a leader of a term at least its own, which is what a live leader contact is here.</summary>
+            /// <param name="state">The state.</param>
+            /// <param name="nodeId">The member.</param>
+            /// <returns><see langword="true" /> when a reachable leader is at the member's term or above.</returns>
+            /// <remarks>
+            /// The model has no clock, so a timeout cannot be an elapsed interval: a member that can hear a live leader is
+            /// the one that would keep resetting its timer, and a member that cannot hear one is the one that times out.
+            /// The rule is therefore reachability, and a transfer hint is the only way past it.
+            /// <para>
+            /// This is the candidate-side rule. The refusal the product applies on the voter — a peer that has just heard
+            /// a leader declines a pre-vote — is not modelled, and its absence is permissive: a model voter grants
+            /// whenever it has not voted in the term and the candidate's log is up to date, so the explored set holds
+            /// every vote a stricter voter would refuse, and a safety violation needing such a grant would be found. The
+            /// omission buys nothing for disruption, which is what the voter-side rule exists to prevent.
+            /// </para>
+            /// <para>
+            /// Reachability is not timeliness, and this half of the omission is not permissive. The model holds no elapsed
+            /// time, so it cannot represent a contact that has expired while the leader is still connected: the production
+            /// rule depends on how long ago a contact was received, and a follower whose leader's messages are delayed past
+            /// its election timeout campaigns. This rule forbids that member from campaigning, which removes campaigns
+            /// rather than adding them, so the argument above does not reach it. The explored set therefore describes a
+            /// cluster that delivers a deliverable message in time, and an execution in which contact expires under delayed
+            /// delivery is outside it.
+            /// </para>
+            /// </remarks>
+            internal static bool HearsLiveLeader(ClusterState state, int nodeId)
+            {
+                var node = state.Nodes[nodeId];
+                for (var j = 0; j < state.Nodes.Count; j++)
+                {
+                    var other = state.Nodes[j];
+                    if (j == nodeId || other.Role != NodeRole.Leader || other.CurrentTerm < node.CurrentTerm)
+                        continue;
+
+                    if (state.CanCommunicate(nodeId, j))
+                        return true;
+                }
+
+                return false;
+            }
+
+            /// <summary>
+            /// A leader retires on a planned stop: it steps down at once and names one successor to campaign now, so the
+            /// group fails over in what a transfer costs instead of in what an election timeout costs.
+            /// </summary>
+            /// <param name="state">The state.</param>
+            /// <param name="profile">The exploration profile, which bounds the messages in flight.</param>
+            /// <param name="output">The successors.</param>
+            /// <remarks>
+            /// One successor, not every survivor: the freshest log, which the leader knows from its append state. A hint to
+            /// every member would make them campaign at once and split the vote, and the group would wait out a timeout
+            /// anyway. The hint carries the leaving leader's term and confers nothing else.
+            /// </remarks>
+            private static void CollectRetirements(ClusterState state, ExploreProfile profile, List<ClusterState> output)
+            {
+                if (state.Messages.Count >= profile.MaxInFlight)
+                    return;
+
+                for (var i = 0; i < state.Nodes.Count; i++)
+                {
+                    var leader = state.Nodes[i];
+                    if (leader.Role != NodeRole.Leader || leader.Unseeded)
+                        continue;
+
+                    var successors = FreshestSuccessors(state, i);
+                    for (var k = 0; k < successors.Count; k++)
+                    {
+                        var nodes = ModelTransitionUtil.CloneNodes(state.Nodes);
+                        nodes[i] = ModelTransitionUtil.Patch(
+                            ModelRpcCommit.DemoteFollower(leader, leader.CurrentTerm),
+                            new NodePatch { Stopping = true });
+                        var messages = ModelTransitionUtil.CloneMessages(state.Messages);
+                        messages.Add(new InFlightMessage(state.NextMessageId, MessagePayload.TransferHint(i, successors[k], leader.CurrentTerm)));
+                        output.Add(state.WithNodesMessages(nodes, messages, state.NextMessageId + 1));
+                    }
+                }
+            }
+
+            /// <summary>Sends the hint from a leader that is not leaving; the sound rule produces a hint only from a retirement.</summary>
+            /// <param name="state">The state.</param>
+            /// <param name="profile">The exploration profile.</param>
+            /// <param name="broken">The injected fault; only <see cref="BrokenMode.TransferHint" /> collects anything.</param>
+            /// <param name="output">The successors.</param>
+            /// <remarks>
+            /// The leader keeps serving while it hands the term on, so the named successor campaigns in a later term than
+            /// the one the leader still answers reads in. Nothing else in the rules forbids it: the members grant the votes
+            /// because their own term is lower, and the leaving candidate would otherwise need no majority to be nominated.
+            /// </remarks>
+            private static void CollectUnretiredHints(ClusterState state, ExploreProfile profile, BrokenMode broken, List<ClusterState> output)
+            {
+                if (broken != BrokenMode.TransferHint || state.Messages.Count >= profile.MaxInFlight)
+                    return;
+
+                for (var i = 0; i < state.Nodes.Count; i++)
+                {
+                    var leader = state.Nodes[i];
+                    if (leader.Role != NodeRole.Leader || leader.Unseeded)
+                        continue;
+
+                    var successors = FreshestSuccessors(state, i);
+                    for (var k = 0; k < successors.Count; k++)
+                    {
+                        var messages = ModelTransitionUtil.CloneMessages(state.Messages);
+                        messages.Add(new InFlightMessage(state.NextMessageId, MessagePayload.TransferHint(i, successors[k], leader.CurrentTerm)));
+                        output.Add(state.WithMessages(messages, state.NextMessageId + 1));
+                    }
+                }
+            }
+
+            /// <summary>Returns every member whose log the leader has replicated furthest, or an empty list when it reaches nobody.</summary>
+            /// <param name="state">The state.</param>
+            /// <param name="leaderId">The leader.</param>
+            /// <returns>The freshest reachable members; more than one when they tie.</returns>
+            /// <remarks>
+            /// All of them, not the lowest id. The transfer profile is explored with symmetry reduction, where states that
+            /// differ only by renaming members share a fingerprint, so a choice that depends on the id is not a property of
+            /// the state: renaming would select a different member and the reduced state would stand for two different
+            /// transitions, one of which would then be dropped. Naming every tied member keeps the set of successors
+            /// invariant under renaming, which is what the reduction needs, and it is the sound over-approximation of a
+            /// leader that may hand the term to any of its equally current members.
+            /// </remarks>
+            private static List<int> FreshestSuccessors(ClusterState state, int leaderId)
+            {
+                var bestMatch = -1;
+                for (var j = 0; j < state.Nodes.Count; j++)
+                {
+                    if (j == leaderId || state.Nodes[j].Unseeded || !state.CanCommunicate(leaderId, j))
+                        continue;
+
+                    if (state.MatchIndexes[j] > bestMatch)
+                        bestMatch = state.MatchIndexes[j];
+                }
+
+                var output = new List<int>(state.Nodes.Count);
+                if (bestMatch < 0)
+                    return output;
+
+                for (var j = 0; j < state.Nodes.Count; j++)
+                {
+                    if (j == leaderId || state.Nodes[j].Unseeded || !state.CanCommunicate(leaderId, j))
+                        continue;
+
+                    if (state.MatchIndexes[j] == bestMatch)
+                        output.Add(j);
+                }
+
+                return output;
+            }
+        }
+
         private static class ModelCatchUps
         {
             internal static void Collect(ClusterState state, ExploreProfile profile, List<ClusterState> output)
@@ -916,6 +1237,7 @@ internal static class ExploreRunner
                         CommitIndex = leader.CommitIndex,
                         AppliedIndex = leader.CommitIndex,
                         Unseeded = false,
+                        Stopping = false,
                     });
                 return state.WithNodes(nodes);
             }
@@ -987,7 +1309,12 @@ internal static class ExploreRunner
                 {
                     Role = NodeRole.Follower,
                     CurrentTerm = term,
-                    VotedFor = -1,
+
+                    // Stepping down inside the term the node is already in must not erase a vote it cast there. A member
+                    // votes at most once per term, and that vote is a fact about the term, not about the role that cast
+                    // it: a retiring leader that voted for itself and then had the vote wiped could grant a second one
+                    // to another candidate in the same term. A move to a later term finds the slot empty, so it clears.
+                    VotedFor = term == node.CurrentTerm ? node.VotedFor : -1,
                     VotesGranted = 0,
                     ReadIndex = 0,
                     ReadAcks = 0,
@@ -1172,6 +1499,7 @@ internal static class ExploreRunner
                     MsgKind.AppendResponse => HandleAppendResponse(state, in msg, new TransitionScratch(nodes, messages, match, nextId), profile, broken),
                     MsgKind.ReadIndexRequest => HandleReadIndexRequest(state, in msg, new TransitionScratch(nodes, messages, match, nextId), profile),
                     MsgKind.ReadIndexResponse => HandleReadIndexResponse(state, in msg, new TransitionScratch(nodes, messages, match, nextId), profile, broken),
+                    MsgKind.TransferHint => HandleTransferHint(state, in msg, new TransitionScratch(nodes, messages, match, nextId), profile, broken),
                     _ => throw new ArgumentOutOfRangeException(nameof(state), msg.Kind, "Unsupported message kind."),
                 };
             }
@@ -1192,7 +1520,28 @@ internal static class ExploreRunner
 
                 var receiver = RefreshAppendReceiver(nodes, in msg);
                 var applied = ApplyAppendIfCurrent(in msg, nodes, receiver, profile);
+                RecordKnownLeader(nodes, in msg);
                 return EnqueueAppendResponse(state, in msg, scratch, profile, applied);
+            }
+
+            /// <summary>Records the sender as the leader of the message's term, when the receiver is in that term.</summary>
+            /// <param name="nodes">The nodes being patched.</param>
+            /// <param name="msg">The append-entries the receiver just took.</param>
+            /// <remarks>
+            /// A follower learns which member leads a term by taking an append-entries from it, and by nothing else: it
+            /// never sees the election, only the assertion. The record is taken even when the log check fails, because
+            /// the follower learned the sender's authority either way; a stale message, sent from a term the receiver has
+            /// already left, teaches nothing and is ignored.
+            /// </remarks>
+            private static void RecordKnownLeader(NodeState[] nodes, in InFlightMessage msg)
+            {
+                var receiver = nodes[msg.To];
+                if (msg.Term != receiver.CurrentTerm)
+                    return;
+
+                nodes[msg.To] = ModelTransitionUtil.Patch(
+                    receiver,
+                    new NodePatch { KnownLeaderTerm = msg.Term, KnownLeaderId = msg.From });
             }
 
             private static NodeState RefreshAppendReceiver(NodeState[] nodes, in InFlightMessage msg)
@@ -1369,6 +1718,52 @@ internal static class ExploreRunner
                 }
             }
 
+            /// <summary>Turns a retiring leader's hint into the named successor's campaign.</summary>
+            /// <param name="state">The state before the hint was delivered.</param>
+            /// <param name="msg">The hint.</param>
+            /// <param name="scratch">The working set, with the hint already taken out of flight.</param>
+            /// <param name="profile">The exploration profile.</param>
+            /// <param name="broken">The injected fault; <see cref="BrokenMode.TransferHintStaleAccept" /> is the stale check removed.</param>
+            /// <returns>The state after the campaign, or the state unchanged when the hint is refused.</returns>
+            /// <remarks>
+            /// A hint is honoured only by a member still in the term the leader left, so a duplicated or replayed hint
+            /// reaches a successor whose term has already moved past it and produces no second term. An unseeded copy
+            /// takes neither the hint nor the campaign. The campaign itself is an ordinary one, run past the
+            /// leader-contact rule: the votes, the log comparison and the current-term commit are all unchanged.
+            /// <see cref="BrokenMode.TransferHintStaleAccept" /> removes the term check and nothing else, so the replay
+            /// test can show that the check is what refuses a duplicated hint rather than some other rule in the path.
+            /// </remarks>
+            private static ClusterState HandleTransferHint(ClusterState state, in InFlightMessage msg, TransitionScratch scratch, ExploreProfile profile, BrokenMode broken)
+            {
+                var delivered = state.WithNodesMessagesMatch(scratch.Nodes, scratch.Messages, scratch.NextMessageId, scratch.Match);
+                var receiver = delivered.Nodes[msg.To];
+                if (receiver.Unseeded)
+                    return delivered;
+
+                // The source has to be speaking for a term it has reached: a hint that names a term above its sender's
+                // own is not a handover from that term, whatever the receiver does with it.
+                if (delivered.Nodes[msg.From].CurrentTerm < msg.Term)
+                    return delivered;
+
+                // D3: the sender's own term says only that it has reached the term, not that it ever led it. A member that
+                // never led can still send a hint naming the term, so the receiver checks the name against the leader it
+                // has actually heard from: the address is only worth as much as the receiver's ability to attribute it.
+                if (receiver.KnownLeaderTerm != msg.Term || receiver.KnownLeaderId != msg.From)
+                    return delivered;
+
+                // A hint names a successor, so it cannot name its sender, and a member already campaigning has started
+                // the campaign the hint would start: the hint has nothing left to confer.
+                if (msg.To == msg.From || receiver.Role == NodeRole.Candidate)
+                    return delivered;
+
+                // A hint is honoured only in the term it was sent from; a duplicate that arrives after the successor
+                // campaigned finds the term already moved and changes nothing, so it cannot produce a second term.
+                var next = delivered;
+                var termAccepted = msg.Term == receiver.CurrentTerm || broken is BrokenMode.TransferHintStaleAccept;
+                var honoured = termAccepted && TryBuildElection(delivered, profile, msg.To, true, out next);
+                return honoured ? next : delivered;
+            }
+
             private static bool IsStaleReadResponse(NodeState leader, in InFlightMessage msg) => leader.Role != NodeRole.Leader || leader.ReadIndex == 0 ||
                                                                                               msg.Term != leader.CurrentTerm || !msg.Success || msg.ReadIndex != leader.ReadIndex;
 
@@ -1389,7 +1784,9 @@ internal static class ExploreRunner
             work.Queue.Enqueue(initial);
 
             var initialViolation = SafetyChecker.Check(initial);
-            return initialViolation != null ? new ExploreResult(1, 0, initialViolation, initial, true, ReconstructPath(work.Parents, startFp)) : Search(work);
+            return initialViolation != null
+                ? new ExploreResult(1, 0, new ViolationReport(initialViolation, initial, null, null), true, ReconstructPath(work.Parents, startFp))
+                : Search(work);
         }
 
         private static string[] ReconstructPath(Dictionary<string, string?> parents, string endFingerprint)
@@ -1427,7 +1824,13 @@ internal static class ExploreRunner
                 }
             }
 
-            return new ExploreResult(work.Seen.Count, transitions, null, null, work.Queue.Count == 0, null);
+            var policyPath = work.FirstPolicyFingerprint == null ? null : ReconstructPath(work.Parents, work.FirstPolicyFingerprint);
+            return new ExploreResult(
+                work.Seen.Count,
+                transitions,
+                new ViolationReport(null, null, work.FirstPolicy, work.FirstPolicyState),
+                work.Queue.Count == 0,
+                policyPath);
         }
 
         private static ExploreResult? VisitSuccessor(SearchWork work, string currentFp, ClusterState next, int transitions)
@@ -1441,10 +1844,14 @@ internal static class ExploreRunner
             work.Parents[fp] = currentFp;
             var violation = SafetyChecker.Check(next);
             if (violation != null)
-                return new ExploreResult(work.Seen.Count, transitions, violation, next, false, ReconstructPath(work.Parents, fp));
+                return new ExploreResult(work.Seen.Count, transitions, new ViolationReport(violation, next, null, null), false, ReconstructPath(work.Parents, fp));
+
+            // A step the protocol does not allow is recorded and the search continues: the state is still a state, so
+            // stopping here would trade a fixed-point reading for a violation that says nothing about the data.
+            work.RecordPolicy(ProtocolPolicyChecker.Check(next), next, fp);
 
             if (work.Seen.Count >= work.Profile.MaxStates)
-                return new ExploreResult(work.Seen.Count, transitions, null, null, false, null);
+                return new ExploreResult(work.Seen.Count, transitions, new ViolationReport(null, null, work.FirstPolicy, work.FirstPolicyState), false, null);
 
             work.Queue.Enqueue(next);
             return null;
@@ -1465,6 +1872,12 @@ internal static class ExploreRunner
 
             internal BrokenMode Broken { get; }
 
+            internal PolicyViolation? FirstPolicy { get; private set; }
+
+            internal string? FirstPolicyFingerprint { get; private set; }
+
+            internal ClusterState? FirstPolicyState { get; private set; }
+
             internal Dictionary<string, string?> Parents { get; }
 
             internal ExploreProfile Profile { get; }
@@ -1474,6 +1887,20 @@ internal static class ExploreRunner
             internal HashSet<string> Seen { get; }
 
             internal List<ClusterState> Successors { get; }
+
+            /// <summary>Keeps the first step the protocol does not allow, and only the first, so the counterexample is stable across runs.</summary>
+            /// <param name="violation">The policy the step broke, or none.</param>
+            /// <param name="state">The state the step produced.</param>
+            /// <param name="fingerprint">The fingerprint of that state, which keys the path back to the start.</param>
+            internal void RecordPolicy(PolicyViolation? violation, ClusterState state, string fingerprint)
+            {
+                if (violation == null || FirstPolicy != null)
+                    return;
+
+                FirstPolicy = violation;
+                FirstPolicyState = state;
+                FirstPolicyFingerprint = fingerprint;
+            }
         }
     }
 

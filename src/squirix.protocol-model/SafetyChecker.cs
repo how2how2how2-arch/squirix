@@ -70,23 +70,34 @@ internal static class SafetyChecker
     private static SafetyViolation? CheckCommittedSurvives(ClusterState state) =>
         CheckStateMachineSafety(state) ?? CheckLeaderCompleteness(state);
 
+    /// <summary>Checks that no term has had two distinct leaders elected, whether or not both still hold the role.</summary>
+    /// <param name="state">The state to check.</param>
+    /// <returns>The violation, or <see langword="null" /> when every term has had one leader.</returns>
+    /// <remarks>
+    /// Election safety is a property of what happened, not of what is currently true: reading the current roles checks
+    /// that no two nodes are leaders at once, which misses the two-in-one-term case whenever the earlier leader has
+    /// retired, because retiring makes it a follower and keeps its term. The evidence is therefore read from the
+    /// recorded elections, which a leader's retirement does not remove.
+    /// </remarks>
     private static SafetyViolation? CheckElectionSafety(ClusterState state)
     {
+        var elected = state.ElectedLeaders;
         var leadersByTerm = new Dictionary<int, int>();
-        for (var i = 0; i < state.Nodes.Count; i++)
+        for (var i = 0; i < elected.Count; i++)
         {
-            var node = state.Nodes[i];
-            if (node.Role != NodeRole.Leader)
-                continue;
-
-            if (leadersByTerm.TryGetValue(node.CurrentTerm, out var other))
+            var election = elected[i];
+            if (!leadersByTerm.TryGetValue(election.Term, out var other))
             {
-                var detail = "Two leaders in term " + node.CurrentTerm.ToString(CultureInfo.InvariantCulture) + ": " + other.ToString(CultureInfo.InvariantCulture) + " and " +
-                             node.Id.ToString(CultureInfo.InvariantCulture);
-                return new SafetyViolation("ElectionSafety", detail, state.Fingerprint(false));
+                leadersByTerm[election.Term] = election.NodeId;
+                continue;
             }
 
-            leadersByTerm[node.CurrentTerm] = node.Id;
+            if (other == election.NodeId)
+                continue;
+
+            var detail = "Two leaders in term " + election.Term.ToString(CultureInfo.InvariantCulture) + ": " + other.ToString(CultureInfo.InvariantCulture) + " and " +
+                         election.NodeId.ToString(CultureInfo.InvariantCulture);
+            return new SafetyViolation("ElectionSafety", detail, state.Fingerprint(false));
         }
 
         return null;

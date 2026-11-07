@@ -11,7 +11,25 @@ namespace Squirix.ProtocolModel.Tests;
 
 public sealed class BrokenModeHistoryTests
 {
-    public static string[] Modes() => Array.FindAll(Enum.GetNames<BrokenMode>(), static mode => !string.Equals(mode, nameof(BrokenMode.None), StringComparison.Ordinal));
+    /// <summary>The modes whose fault the client-history driver models, as the data source passes them to the tests.</summary>
+    /// <remarks>
+    /// The two transfer-hint modes fault the leader-transfer path, which this driver never takes: it starts a term, writes,
+    /// replicates and reads without a planned stop, so a leader that retires and names a successor does not occur in it.
+    /// <see cref="CoversEveryBrokenMode" /> keeps this list from swallowing a mode: every member is either named here or
+    /// named as a transfer mode, and the two lists together are the whole enum.
+    /// </remarks>
+    private static readonly string[] ClientHistoryModes =
+    [
+        nameof(BrokenMode.Vote),
+        nameof(BrokenMode.CurrentTermCommit),
+        nameof(BrokenMode.ReadIndex),
+        nameof(BrokenMode.RepairCeiling),
+        nameof(BrokenMode.LogOrder),
+    ];
+
+    /// <summary>Returns the modes the client-history driver models.</summary>
+    /// <returns><see cref="ClientHistoryModes" />, which the data source reads once per test case.</returns>
+    public static string[] Modes() => ClientHistoryModes;
 
     [Test]
     [MethodDataSource(nameof(Modes))]
@@ -93,8 +111,18 @@ public sealed class BrokenModeHistoryTests
     [Test]
     public async Task CoversEveryBrokenMode()
     {
-        _ = await Assert.That(Enum.GetValues<BrokenMode>().Length).IsEqualTo(6);
+        var transferModes = new[] { nameof(BrokenMode.TransferHint), nameof(BrokenMode.TransferHintStaleAccept) };
+        _ = await Assert.That(Enum.GetValues<BrokenMode>().Length).IsEqualTo(8);
         foreach (var mode in Enum.GetValues<BrokenMode>())
-            _ = await Assert.That(mode is BrokenMode.None or BrokenMode.Vote or BrokenMode.CurrentTermCommit or BrokenMode.ReadIndex or BrokenMode.RepairCeiling or BrokenMode.LogOrder).IsTrue();
+            _ = await Assert.That(mode is BrokenMode.None or BrokenMode.Vote or BrokenMode.CurrentTermCommit or BrokenMode.ReadIndex or BrokenMode.RepairCeiling or BrokenMode.LogOrder or BrokenMode.TransferHint or BrokenMode.TransferHintStaleAccept).IsTrue();
+
+        // Every member is either driven by the client-history scenarios or named as a transfer mode, so a mode added later
+        // cannot be skipped by both lists and still pass here.
+        var notDriven = Array.FindAll(
+            Enum.GetNames<BrokenMode>(),
+            static name => !string.Equals(name, nameof(BrokenMode.None), StringComparison.Ordinal) && Array.IndexOf(ClientHistoryModes, name) < 0);
+        _ = await Assert.That(notDriven.Length).IsEqualTo(transferModes.Length);
+        foreach (var transferMode in transferModes)
+            _ = await Assert.That(Array.IndexOf(notDriven, transferMode)).IsGreaterThanOrEqualTo(0);
     }
 }

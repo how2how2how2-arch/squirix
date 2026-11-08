@@ -57,11 +57,18 @@ internal static class ModelHintHistory
     /// <param name="nodes">The members of the state being built.</param>
     /// <returns>The evidence that can still change, in the same order; the same list when nothing is dropped.</returns>
     /// <remarks>
-    /// A member names a successor only while it leads the term it names, so once it does not, its record can never gain a
-    /// second successor: keeping it would split states that are one state as far as this policy is concerned, and under the
-    /// sound rule — where the retirement demotes the leader in the same step — it would make every retirement carry a
-    /// permanently distinguishing label. Dropping it costs no report, because the violation is raised at the step that
-    /// records it, which is the step that took it.
+    /// A member names a successor only while it leads the term it names, so once it does not, a record holding one
+    /// successor can never gain a second: keeping it would split states that are one state as far as this policy is
+    /// concerned, and under the sound rule — where the retirement demotes the leader in the same step — it would make
+    /// every retirement carry a permanently distinguishing label.
+    /// <para>
+    /// A record that already named a second successor is the other case, and the reason this prune cannot be stated as
+    /// "drop what the sender can no longer add to". That record is the violation itself: it can never change again, and
+    /// it is the only place the violation is held once the hints that produced it have left the message list. When the
+    /// retirement that names the second successor is also the step that demotes the sender, this prune runs against the
+    /// new roles and would erase the evidence at the instant it became a verdict — so a state that violates the policy
+    /// would be reported as clean. Evidence that can still change is dropped; evidence that has become the answer is kept.
+    /// </para>
     /// </remarks>
     internal static IReadOnlyList<ModelHintEmission> Prune(IReadOnlyList<ModelHintEmission> previous, IReadOnlyList<NodeState> nodes)
     {
@@ -87,6 +94,9 @@ internal static class ModelHintHistory
 
     private static bool CanStillName(in ModelHintEmission record, IReadOnlyList<NodeState> nodes)
     {
+        if (record.SecondSuccessor >= 0)
+            return true;
+
         var node = nodes[record.Sender];
         return node.Role == NodeRole.Leader && node.CurrentTerm == record.Term;
     }

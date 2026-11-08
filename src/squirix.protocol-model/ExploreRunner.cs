@@ -253,7 +253,8 @@ internal static class ExploreRunner
                                 + "-hint-names-every-tied-successor-hint-reception-guards-emission-policy"
                                 + "-election-history-survives-retirement-retirement-closes-admission-until-restart"
                                 + "-hint-attributed-to-the-leader-the-receiver-knows"
-                                + "-hint-emission-history-per-term";
+                                + "-hint-emission-history-per-term"
+                                + "-established-violation-survives-demotion";
         var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(semantic));
         var sb = new StringBuilder(16);
         for (var i = 0; i < 8; i++)

@@ -15,13 +15,15 @@ internal sealed class ClusterState
         IReadOnlyList<InFlightMessage> messages,
         IReadOnlyList<int> partitions,
         int nextMessageId,
-        (IReadOnlyList<int> MatchIndexes, int DiskLosses, IReadOnlyList<ModelCommitDecision> Commits, IReadOnlyList<ModelElectionRecord> Elections) progress)
+        (IReadOnlyList<int> MatchIndexes, int DiskLosses, IReadOnlyList<ModelCommitDecision> Commits, IReadOnlyList<ModelElectionRecord> Elections) progress,
+        ClusterState? previous = null)
     {
-        Nodes = CopyNodes(nodes);
-        Messages = CopyMessages(messages);
-        Partitions = CopyInts(partitions);
+        // Only collections already owned by the previous immutable state can be shared.
+        Nodes = previous != null && ReferenceEquals(nodes, previous.Nodes) ? nodes : CopyNodes(nodes);
+        Messages = previous != null && ReferenceEquals(messages, previous.Messages) ? messages : CopyMessages(messages);
+        Partitions = previous != null && ReferenceEquals(partitions, previous.Partitions) ? partitions : CopyInts(partitions);
         NextMessageId = nextMessageId;
-        MatchIndexes = CopyInts(progress.MatchIndexes);
+        MatchIndexes = previous != null && ReferenceEquals(progress.MatchIndexes, previous.MatchIndexes) ? progress.MatchIndexes : CopyInts(progress.MatchIndexes);
         DiskLosses = progress.DiskLosses;
         CommittedEntries = ModelCommitHistory.Record(progress.Commits, Nodes);
         ElectedLeaders = ModelElectionHistory.Record(progress.Elections, Nodes);
@@ -88,7 +90,7 @@ internal sealed class ClusterState
     /// <param name="matchIndexes">The match indexes, the wiped node's reset.</param>
     /// <returns>The state with one more disk loss.</returns>
     internal ClusterState WithDiskLoss(IReadOnlyList<NodeState> nodes, IReadOnlyList<int> matchIndexes) =>
-        new(nodes, Messages, Partitions, NextMessageId, (matchIndexes, DiskLosses + 1, CommittedEntries, ElectedLeaders));
+        new(nodes, Messages, Partitions, NextMessageId, (matchIndexes, DiskLosses + 1, CommittedEntries, ElectedLeaders), this);
 
     internal ClusterState WithMatchIndexes(IReadOnlyList<int> matchIndexes) => With(matchIndexes: matchIndexes);
 
@@ -130,7 +132,8 @@ internal sealed class ClusterState
         messages ?? Messages,
         partitions ?? Partitions,
         nextMessageId ?? NextMessageId,
-        (matchIndexes ?? MatchIndexes, DiskLosses, CommittedEntries, elections ?? ElectedLeaders));
+        (matchIndexes ?? MatchIndexes, DiskLosses, CommittedEntries, elections ?? ElectedLeaders),
+        this);
 
     private static int[] CopyInts(IReadOnlyList<int> values)
     {
@@ -604,11 +607,11 @@ internal sealed class ClusterState
             {
                 var nodes = state.Nodes;
                 var count = nodes.Count;
-                var order = new int[count];
+                var order = count <= MaxStackItems ? stackalloc int[count] : new int[count];
                 BuildSymmetryOrder(nodes, order);
 
-                var starts = new int[count];
-                var lengths = new int[count];
+                var starts = count <= MaxStackItems ? stackalloc int[count] : new int[count];
+                var lengths = count <= MaxStackItems ? stackalloc int[count] : new int[count];
                 var runCount = BuildTieRuns(nodes, order, starts, lengths);
                 if (runCount == 0)
                 {
@@ -630,35 +633,35 @@ internal sealed class ClusterState
                     return;
                 }
 
-                AppendSmallest(sb, state, new LabellingPlan(order, starts, lengths, runCount, labellings));
+                AppendSmallest(sb, state, order, starts[..runCount], lengths[..runCount], labellings);
             }
 
-            private static void AppendBody(FingerprintWriter sb, ClusterState state, int[] order)
+            private static void AppendBody(FingerprintWriter sb, ClusterState state, ReadOnlySpan<int> order)
             {
-                var map = new int[order.Length];
+                var map = order.Length <= MaxStackItems ? stackalloc int[order.Length] : new int[order.Length];
                 ApplyOrder(order, map);
                 AppendNodePartitions(sb, state, order, map);
                 AppendOrderedMessages(sb, state.Messages, map);
             }
 
-            private static void AppendSmallest(FingerprintWriter sb, ClusterState state, in LabellingPlan plan)
+            private static void AppendSmallest(FingerprintWriter sb, ClusterState state, ReadOnlySpan<int> order, ReadOnlySpan<int> starts, ReadOnlySpan<int> lengths, int labellings)
             {
                 var candidate = Candidate.Value!;
                 var best = BestCandidate.Value!;
                 best.Clear();
-                var listed = new int[plan.Order.Length];
-                var map = new int[plan.Order.Length];
-                for (var index = 0; index < plan.Labellings; index++)
+                var listed = order.Length <= MaxStackItems ? stackalloc int[order.Length] : new int[order.Length];
+                var map = new int[order.Length];
+                for (var index = 0; index < labellings; index++)
                 {
-                    Array.Copy(plan.Order, listed, listed.Length);
+                    order.CopyTo(listed);
                     var rest = index;
-                    for (var run = 0; run < plan.RunCount; run++)
+                    for (var run = 0; run < starts.Length; run++)
                     {
-                        var block = Factorial(plan.Lengths[run]);
+                        var block = Factorial(lengths[run]);
                         var pick = rest % block;
                         rest /= block;
-                        var members = plan.Order.AsSpan(plan.Starts[run], plan.Lengths[run]);
-                        WritePermutation(members, pick, listed.AsSpan(plan.Starts[run], plan.Lengths[run]));
+                        var members = order.Slice(starts[run], lengths[run]);
+                        WritePermutation(members, pick, listed.Slice(starts[run], lengths[run]));
                     }
 
                     ApplyOrder(listed, map);
@@ -746,8 +749,6 @@ internal sealed class ClusterState
 
                 return result;
             }
-
-            private readonly record struct LabellingPlan(int[] Order, int[] Starts, int[] Lengths, int RunCount, int Labellings);
         }
     }
 }

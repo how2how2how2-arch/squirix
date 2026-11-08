@@ -825,18 +825,41 @@ internal sealed class ClusterState
             /// <param name="emissions">The hint evidence retained so far.</param>
             /// <param name="map">The relabelling, empty when the state keeps its own labels.</param>
             /// <remarks>
+            /// <para>
             /// The evidence names the member and the successors it named, so every id in it is relabelled like any other
             /// in the key. Written with the ids the state happens to hold, two states that differ only by renaming keep
             /// different keys, the exploration stops merging them, and the reduction silently costs the saving it exists
             /// to give.
+            /// </para>
+            /// <para>
+            /// What the key writes about that evidence is the answer the policy checker reads from it, and not the records
+            /// themselves. A retained record that already names a second successor is the violation, the check reports the
+            /// first such record it meets, and the search keeps only that first report — so one marker says everything a
+            /// key has to tell apart. A state holding such a record must not key like a state holding none. That was the
+            /// defect: the marker was left out on the claim that the search stops at a policy violation, and the search
+            /// does not stop. The successor's key is looked up in the seen set before the policy checker runs, and a state
+            /// that breaks a policy is still a state, so it is recorded and explored; one that keyed like its clean twin
+            /// was discarded as already seen, before anything had checked it.
+            /// </para>
+            /// <para>
+            /// The record's own content stays out of the key, and what that costs is a merge, not a lost report. Two states
+            /// agreeing on every other field produce the same successors, and both hold a violation the policy reports
+            /// under one name, so exploring one of them reports what exploring the other would. Writing the content
+            /// instead separates states the checker cannot tell apart: on <c lang="csharp">SmallTransferOneMoreTerm</c> the fault profile
+            /// then exhausted its 300 000 states without reaching a fixed point, and lost the counterexample path with it.
+            /// </para>
             /// </remarks>
             internal static void Append(FingerprintWriter sb, IReadOnlyList<ModelHintEmission> emissions, ReadOnlySpan<int> map)
             {
                 var count = emissions.Count;
+                var twoSuccessors = false;
                 var order = count <= MaxStackItems ? stackalloc int[count] : new int[count];
                 for (var i = 0; i < count; i++)
                 {
                     var current = emissions[i];
+                    if (current.SecondSuccessor >= 0)
+                        twoSuccessors = true;
+
                     var j = i;
                     while (j > 0)
                     {
@@ -852,16 +875,10 @@ internal sealed class ClusterState
                 }
 
                 sb.Append('H');
+                sb.Append(twoSuccessors ? '!' : '.');
                 for (var i = 0; i < count; i++)
                 {
                     var emission = emissions[order[i]];
-
-                    // A record that has already named a second successor is not written into the key. That is sound only
-                    // because such a record cannot be the first thing wrong: naming a second successor needs a sender
-                    // that still leads the term, and the retirement rule reports exactly that on the same state, so the
-                    // search stops there before this record could decide a key. It also has to be so — the search checks
-                    // a state only when its key is new, so a record kept in the key after it had been reported would
-                    // double every later state and buy no second report.
                     if (emission.SecondSuccessor >= 0)
                         continue;
 
@@ -870,13 +887,7 @@ internal sealed class ClusterState
                     sb.Append(emission.Term);
                     sb.Append('>');
                     sb.Append(Mapped(map, emission.FirstSuccessor));
-                    sb.Append('/');
-                    if (emission.SecondSuccessor < 0)
-                        sb.Append("-1");
-                    else
-                        sb.Append(Mapped(map, emission.SecondSuccessor));
-
-                    sb.Append(';');
+                    sb.Append("/-1;");
                 }
             }
 

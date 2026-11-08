@@ -254,7 +254,7 @@ internal static class ExploreRunner
                                 + "-election-history-survives-retirement-retirement-closes-admission-until-restart"
                                 + "-hint-attributed-to-the-leader-the-receiver-knows"
                                 + "-hint-emission-history-per-term"
-                                + "-established-violation-survives-demotion";
+                                + "-established-violation-marks-its-state-apart-from-clean-ones";
         var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(semantic));
         var sb = new StringBuilder(16);
         for (var i = 0; i < 8; i++)

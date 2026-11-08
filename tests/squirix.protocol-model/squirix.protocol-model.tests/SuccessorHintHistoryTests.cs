@@ -165,6 +165,65 @@ public sealed class SuccessorHintHistoryTests
         _ = await Assert.That(violation.Detail).Contains("did not name one");
     }
 
+    /// <summary>A state the checker calls violating never shares its exploration key with a clean one.</summary>
+    /// <returns>The assertion task.</returns>
+    /// <remarks>
+    /// <para>
+    /// The exploration decides whether to look at a state by its key, and it does that before it asks the policy checker.
+    /// A violating state whose key equals a clean state's key is therefore discarded as already seen, and the violation it
+    /// carries is never recorded — the state retains the evidence and the search still loses it.
+    /// </para>
+    /// <para>
+    /// The states here come from the model's own transitions, not from a hand-built pair: the clean keys are the ones
+    /// <see cref="ExploreRunner.ReachableStates" /> returns and the checker calls clean, and the violating keys are on
+    /// successors <see cref="ExploreRunner.NextStates" /> produces from them. Nothing is fabricated and no history is
+    /// removed, so a collision found this way is one the real search can take.
+    /// </para>
+    /// </remarks>
+    [Test]
+    public async Task ReachableViolationNeverSharesCleanKey()
+    {
+        var profile = ExploreProfile.SmallTransferOneMoreTerm();
+        const BrokenMode broken = BrokenMode.TransferHint;
+        var reachable = ExploreRunner.ReachableStates(profile, broken);
+
+        HashSet<string> clean = [with(StringComparer.Ordinal)];
+        for (var i = 0; i < reachable.Count; i++)
+        {
+            if (ProtocolPolicyChecker.Check(reachable[i]) == null)
+                _ = clean.Add(reachable[i].Fingerprint(profile.SymmetryReduce));
+        }
+
+        var violating = 0;
+        string? collision = null;
+        for (var i = 0; i < reachable.Count && collision == null; i++)
+        {
+            var successors = ExploreRunner.NextStates(reachable[i], profile, broken);
+            for (var k = 0; k < successors.Count; k++)
+            {
+                var violation = ProtocolPolicyChecker.Check(successors[k]);
+                if (violation == null
+                    || !string.Equals(violation.Policy, ProtocolPolicyChecker.HintNamesOneSuccessor, StringComparison.Ordinal))
+                    continue;
+
+                violating++;
+                var key = successors[k].Fingerprint(profile.SymmetryReduce);
+                if (clean.Contains(key))
+                {
+                    collision = violation.Detail;
+                    break;
+                }
+            }
+        }
+
+        _ = await Assert.That(violating).IsGreaterThan(0)
+            .Because("the fault names two successors in one term, so the walk must produce violating successors");
+        _ = await Assert.That(collision).IsNull()
+            .Because(
+                "the violating successor sits on a key the exploration already holds for a clean state, so the search " +
+                "discards it before the checker sees it: " + (collision ?? string.Empty));
+    }
+
     /// <summary>Drives the fault's hint, its departure, and a retirement naming a different successor.</summary>
     /// <param name="broken">The injected fault.</param>
     /// <returns>The witness, or <see langword="null" /> when no reachable leader reaches the three steps.</returns>

@@ -35,8 +35,9 @@ internal static class GroupSnapshotFile
                 groupId,
                 GroupSnapshotStore.DefaultMaxSnapshotBytes,
                 GroupStoragePaths.GetSnapshotSlotPath(persistenceRoot, groupId, 0),
-                GroupStoragePaths.GetSnapshotSlotPath(persistenceRoot, groupId, 1)));
-        if (selection.Snapshot == null)
+                GroupStoragePaths.GetSnapshotSlotPath(persistenceRoot, groupId, 1)),
+            false);
+        if (selection.Sequence == 0UL)
             throw new InvalidDataException($"The snapshot slots of group '{groupId}' hold no valid snapshot.");
 
         var slot = (selection.Slot == 0 ? first : second)!;
@@ -83,11 +84,14 @@ internal static class GroupSnapshotFile
     /// <param name="length">The length to keep in bytes.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>A task that completes when the file is cut.</returns>
-    internal static async Task TearAsync(string persistenceRoot, string groupId, int slot, int length, CancellationToken cancellationToken)
+    internal static Task TearAsync(string persistenceRoot, string groupId, int slot, int length, CancellationToken cancellationToken)
     {
         var path = GroupStoragePaths.GetSnapshotSlotPath(persistenceRoot, groupId, slot);
-        var bytes = await File.ReadAllBytesAsync(path, cancellationToken).ConfigureAwait(false);
-        await File.WriteAllBytesAsync(path, bytes.AsMemory(0, Math.Min(length, bytes.Length)), cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        using var handle = File.OpenHandle(path, FileMode.Open, FileAccess.Write, FileShare.Read);
+        ArgumentOutOfRangeException.ThrowIfNegative(length);
+        RandomAccess.SetLength(handle, Math.Min(length, RandomAccess.GetLength(handle)));
+        return Task.CompletedTask;
     }
 
     /// <summary>Copies the slot files of one group to the directory of another, as a restored backup would.</summary>

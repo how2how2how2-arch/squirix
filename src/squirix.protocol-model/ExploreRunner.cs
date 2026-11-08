@@ -89,7 +89,7 @@ internal static class ExploreRunner
             var successors = NextStates(current, profile, broken);
             for (var i = 0; i < successors.Count; i++)
             {
-                if (!seen.Add(successors[i].Fingerprint(profile.SymmetryReduce)))
+                if (!seen.GetAlternateLookup<ReadOnlySpan<char>>().Add(successors[i].FingerprintChars(profile.SymmetryReduce)))
                     continue;
 
                 output.Add(successors[i]);
@@ -1781,7 +1781,7 @@ internal static class ExploreRunner
             var startFp = initial.Fingerprint(profile.SymmetryReduce);
             _ = work.Seen.Add(startFp);
             work.Parents[startFp] = null;
-            work.Queue.Enqueue(initial);
+            work.Queue.Enqueue(new QueuedState(initial, startFp));
 
             var initialViolation = SafetyChecker.Check(initial);
             return initialViolation != null
@@ -1812,8 +1812,7 @@ internal static class ExploreRunner
             var transitions = 0;
             while (work.Queue.Count > 0 && work.Seen.Count < work.Profile.MaxStates)
             {
-                var current = work.Queue.Dequeue();
-                var currentFp = current.Fingerprint(work.Profile.SymmetryReduce);
+                var (current, currentFp) = work.Queue.Dequeue();
                 ModelTransitions.CollectSuccessors(current, work.Profile, work.Broken, work.Successors);
                 for (var i = 0; i < work.Successors.Count; i++)
                 {
@@ -1848,14 +1847,18 @@ internal static class ExploreRunner
 
             // A step the protocol does not allow is recorded and the search continues: the state is still a state, so
             // stopping here would trade a fixed-point reading for a violation that says nothing about the data.
-            work.RecordPolicy(ProtocolPolicyChecker.Check(next), next, fp);
+            work.RecordPolicy(next, fp);
 
             if (work.Seen.Count >= work.Profile.MaxStates)
                 return new ExploreResult(work.Seen.Count, transitions, new ViolationReport(null, null, work.FirstPolicy, work.FirstPolicyState), false, null);
 
-            work.Queue.Enqueue(next);
+            work.Queue.Enqueue(new QueuedState(next, fp));
             return null;
         }
+
+        [Immutable]
+        [StructLayout(LayoutKind.Auto)]
+        private readonly record struct QueuedState(ClusterState State, string Fingerprint);
 
         [Immutable]
         private sealed class SearchWork
@@ -1866,7 +1869,7 @@ internal static class ExploreRunner
                 Broken = broken;
                 Seen = [with(StringComparer.Ordinal)];
                 Parents = [with(StringComparer.Ordinal)];
-                Queue = new Queue<ClusterState>();
+                Queue = new Queue<QueuedState>();
                 Successors = [with(64)];
             }
 
@@ -1882,19 +1885,22 @@ internal static class ExploreRunner
 
             internal ExploreProfile Profile { get; }
 
-            internal Queue<ClusterState> Queue { get; }
+            internal Queue<QueuedState> Queue { get; }
 
             internal HashSet<string> Seen { get; }
 
             internal List<ClusterState> Successors { get; }
 
             /// <summary>Keeps the first step the protocol does not allow, and only the first, so the counterexample is stable across runs.</summary>
-            /// <param name="violation">The policy the step broke, or none.</param>
             /// <param name="state">The state the step produced.</param>
             /// <param name="fingerprint">The fingerprint of that state, which keys the path back to the start.</param>
-            internal void RecordPolicy(PolicyViolation? violation, ClusterState state, string fingerprint)
+            internal void RecordPolicy(ClusterState state, string fingerprint)
             {
-                if (violation == null || FirstPolicy != null)
+                if (FirstPolicy != null)
+                    return;
+
+                var violation = ProtocolPolicyChecker.Check(state);
+                if (violation == null)
                     return;
 
                 FirstPolicy = violation;

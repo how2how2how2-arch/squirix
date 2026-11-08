@@ -19,14 +19,31 @@ internal sealed class ClusterState
         ClusterState? previous = null)
     {
         // Only collections already owned by the previous immutable state can be shared.
-        Nodes = previous != null && ReferenceEquals(nodes, previous.Nodes) ? nodes : CopyNodes(nodes);
-        Messages = previous != null && ReferenceEquals(messages, previous.Messages) ? messages : CopyMessages(messages);
-        Partitions = previous != null && ReferenceEquals(partitions, previous.Partitions) ? partitions : CopyInts(partitions);
+        Nodes = previous != null && HasSameItems(nodes, previous.Nodes) ? previous.Nodes : CopyItems(nodes);
+        Messages = previous != null && ReferenceEquals(messages, previous.Messages) ? messages : CopyItems(messages);
+        Partitions = previous != null && HasSameItems(partitions, previous.Partitions) ? previous.Partitions : CopyItems(partitions);
         NextMessageId = nextMessageId;
-        MatchIndexes = previous != null && ReferenceEquals(progress.MatchIndexes, previous.MatchIndexes) ? progress.MatchIndexes : CopyInts(progress.MatchIndexes);
+        MatchIndexes = previous != null && HasSameItems(progress.MatchIndexes, previous.MatchIndexes) ? previous.MatchIndexes : CopyItems(progress.MatchIndexes);
         DiskLosses = progress.DiskLosses;
         CommittedEntries = ModelCommitHistory.Record(progress.Commits, Nodes);
         ElectedLeaders = ModelElectionHistory.Record(progress.Elections, Nodes);
+    }
+
+    private ClusterState(ClusterState previous, int removedMessageIndex)
+    {
+        var count = previous.Messages.Count - 1;
+        InFlightMessage[] messages = count == 0 ? [] : new InFlightMessage[count];
+        for (var i = 0; i < count; i++)
+            messages[i] = previous.Messages[i < removedMessageIndex ? i : i + 1];
+
+        Nodes = previous.Nodes;
+        Messages = messages;
+        Partitions = previous.Partitions;
+        NextMessageId = previous.NextMessageId;
+        MatchIndexes = previous.MatchIndexes;
+        DiskLosses = previous.DiskLosses;
+        CommittedEntries = ModelCommitHistory.Record(previous.CommittedEntries, Nodes);
+        ElectedLeaders = ModelElectionHistory.Record(previous.ElectedLeaders, Nodes);
     }
 
     /// <summary>Gets persistent checker evidence, including the decision term rather than only the entry term.</summary>
@@ -135,29 +152,38 @@ internal sealed class ClusterState
         (matchIndexes ?? MatchIndexes, DiskLosses, CommittedEntries, elections ?? ElectedLeaders),
         this);
 
-    private static int[] CopyInts(IReadOnlyList<int> values)
+    /// <summary>Returns a state with one message removed, keeping the order and identity of the others.</summary>
+    /// <param name="messageIndex">The position of the message to remove.</param>
+    /// <returns>The state after the message was dropped.</returns>
+    internal ClusterState WithoutMessage(int messageIndex)
     {
-        var copy = new int[values.Count];
+        ArgumentOutOfRangeException.ThrowIfNegative(messageIndex);
+        ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(messageIndex, Messages.Count);
+        return new ClusterState(this, messageIndex);
+    }
+
+    private static bool HasSameItems<T>(IReadOnlyList<T> values, IReadOnlyList<T> previous)
+    {
+        if (ReferenceEquals(values, previous))
+            return true;
+
+        if (values.Count != previous.Count)
+            return false;
+
+        for (var i = 0; i < values.Count; i++)
+        {
+            if (!EqualityComparer<T>.Default.Equals(values[i], previous[i]))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static T[] CopyItems<T>(IReadOnlyList<T> values)
+    {
+        var copy = new T[values.Count];
         for (var i = 0; i < values.Count; i++)
             copy[i] = values[i];
-
-        return copy;
-    }
-
-    private static InFlightMessage[] CopyMessages(IReadOnlyList<InFlightMessage> messages)
-    {
-        var copy = new InFlightMessage[messages.Count];
-        for (var i = 0; i < messages.Count; i++)
-            copy[i] = messages[i];
-
-        return copy;
-    }
-
-    private static NodeState[] CopyNodes(IReadOnlyList<NodeState> nodes)
-    {
-        var copy = new NodeState[nodes.Count];
-        for (var i = 0; i < nodes.Count; i++)
-            copy[i] = nodes[i];
 
         return copy;
     }
@@ -650,7 +676,7 @@ internal sealed class ClusterState
                 var best = BestCandidate.Value!;
                 best.Clear();
                 var listed = order.Length <= MaxStackItems ? stackalloc int[order.Length] : new int[order.Length];
-                var map = new int[order.Length];
+                var map = order.Length <= MaxStackItems ? stackalloc int[order.Length] : new int[order.Length];
                 for (var index = 0; index < labellings; index++)
                 {
                     order.CopyTo(listed);

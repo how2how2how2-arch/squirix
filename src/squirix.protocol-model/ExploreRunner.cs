@@ -77,23 +77,19 @@ internal static class ExploreRunner
     internal static List<ClusterState> ReachableStates(ExploreProfile profile, BrokenMode broken)
     {
         ArgumentNullException.ThrowIfNull(profile);
-        var output = new List<ClusterState>();
-        var seen = new HashSet<string>(StringComparer.Ordinal) { ClusterState.CreateInitial(profile.ReplicaCount).Fingerprint(profile.SymmetryReduce) };
-        var queue = new Queue<ClusterState>();
         var initial = ClusterState.CreateInitial(profile.ReplicaCount);
-        queue.Enqueue(initial);
-        output.Add(initial);
-        while (queue.Count > 0)
+        List<ClusterState> output = [initial];
+        var seen = new HashSet<string>(StringComparer.Ordinal) { initial.Fingerprint(profile.SymmetryReduce) };
+        var successors = new List<ClusterState>();
+        for (var head = 0; head < output.Count; head++)
         {
-            var current = queue.Dequeue();
-            var successors = NextStates(current, profile, broken);
+            ModelTransitions.CollectSuccessors(output[head], profile, broken, successors);
             for (var i = 0; i < successors.Count; i++)
             {
                 if (!seen.GetAlternateLookup<ReadOnlySpan<char>>().Add(successors[i].FingerprintChars(profile.SymmetryReduce)))
                     continue;
 
                 output.Add(successors[i]);
-                queue.Enqueue(successors[i]);
             }
         }
 
@@ -471,6 +467,30 @@ internal static class ExploreRunner
 
     [Immutable]
     [StructLayout(LayoutKind.Auto)]
+    private readonly struct CommitProbe
+    {
+        internal CommitProbe(NodeState leader, IReadOnlyList<NodeState> nodes, int[] match, ExploreProfile profile, BrokenMode broken)
+        {
+            Leader = leader;
+            Nodes = nodes;
+            Match = match;
+            Profile = profile;
+            Broken = broken;
+        }
+
+        internal BrokenMode Broken { get; }
+
+        internal NodeState Leader { get; }
+
+        internal int[] Match { get; }
+
+        internal IReadOnlyList<NodeState> Nodes { get; }
+
+        internal ExploreProfile Profile { get; }
+    }
+
+    [Immutable]
+    [StructLayout(LayoutKind.Auto)]
     private readonly record struct TraceSearchState(ClusterState State, int TraceIndex);
 
     private static class ModelTransitions
@@ -590,7 +610,7 @@ internal static class ExploreRunner
                 // Crash after durable writes: keep term/vote/log/commit; reset volatile.
                 var nodes = ModelTransitionUtil.CloneNodes(state.Nodes);
                 var runtime = NodeRuntime.Create(node.CommitIndex, 0, 0, 0, 0, false);
-                nodes[i] = new NodeState(node.Id, NodeRole.Follower, node.CurrentTerm, node.VotedFor, node.LogEntries, in runtime, node.Unseeded);
+                nodes[i] = node.With(NodeRole.Follower, node.CurrentTerm, node.VotedFor, node.LogEntries, in runtime, node.Unseeded);
                 var match = ModelTransitionUtil.CloneInts(state.MatchIndexes);
                 match[i] = 0;
                 output.Add(state.WithNodesMatch(nodes, match));
@@ -613,11 +633,7 @@ internal static class ExploreRunner
         private static void CollectDrops(ClusterState state, List<ClusterState> output)
         {
             for (var i = 0; i < state.Messages.Count; i++)
-            {
-                var messages = ModelTransitionUtil.CloneMessages(state.Messages);
-                messages.RemoveAt(i);
-                output.Add(state.WithMessages(messages));
-            }
+                output.Add(state.WithoutMessage(i));
         }
 
         private static void CollectDuplicates(ClusterState state, ExploreProfile profile, List<ClusterState> output)
@@ -1330,10 +1346,11 @@ internal static class ExploreRunner
                 var match = ModelTransitionUtil.CloneInts(state.MatchIndexes);
                 match[leaderId] = leader.LastLogIndex;
 
-                var nodes = ModelTransitionUtil.CloneNodes(state.Nodes);
-                if (!TryFindNewCommit(new CommitProbe(leader, nodes, match, profile, broken), out var newCommit))
+                var probe = new CommitProbe(leader, state.Nodes, match, profile, broken);
+                if (!TryFindNewCommit(in probe, out var newCommit))
                     return state.WithMatchIndexes(match);
 
+                var nodes = ModelTransitionUtil.CloneNodes(state.Nodes);
                 nodes[leaderId] = ModelTransitionUtil.Patch(leader, new NodePatch { CommitIndex = newCommit });
                 return state.WithNodesMatch(nodes, match);
             }
@@ -1455,7 +1472,7 @@ internal static class ExploreRunner
             /// <see cref="BrokenMode.CurrentTermCommit" /> fault an earlier-term entry counts alone; the checker then sees a committed entry
             /// that a later leader does not hold.
             /// </remarks>
-            private static bool IsCommittable(CommitProbe probe, int index)
+            private static bool IsCommittable(in CommitProbe probe, int index)
             {
                 var counts = HasCurrentTermEntryThrough(probe.Leader, index) || probe.Broken is BrokenMode.CurrentTermCommit;
                 var majority = probe.Profile.Majority;
@@ -1463,11 +1480,11 @@ internal static class ExploreRunner
                        IsContiguousMatchingMajority(probe.Leader, probe.Nodes, probe.Match, probe.Leader.CommitIndex + 1, index, majority);
             }
 
-            private static bool TryFindNewCommit(CommitProbe probe, out int newCommit)
+            private static bool TryFindNewCommit(in CommitProbe probe, out int newCommit)
             {
                 for (var n = probe.Leader.LastLogIndex; n > probe.Leader.CommitIndex; n--)
                 {
-                    if (!IsCommittable(probe, n))
+                    if (!IsCommittable(in probe, n))
                         continue;
 
                     newCommit = n;
@@ -1554,14 +1571,9 @@ internal static class ExploreRunner
                 return nodes[msg.To];
             }
 
-            private static AppendOutcome ApplyAppendIfCurrent(in InFlightMessage msg, NodeState[] nodes, NodeState receiver, ExploreProfile profile)
-            {
-                if (msg.Term < receiver.CurrentTerm)
-                    return new AppendOutcome(false, receiver.LastLogIndex);
-
-                var outcome = ModelRpcCommit.ApplyAppendEntries(in msg, nodes, profile);
-                return new AppendOutcome(outcome.Success, outcome.MatchIndex);
-            }
+            private static AppendOutcome ApplyAppendIfCurrent(in InFlightMessage msg, NodeState[] nodes, NodeState receiver, ExploreProfile profile) => msg.Term < receiver.CurrentTerm
+                ? new AppendOutcome(false, receiver.LastLogIndex)
+                : ModelRpcCommit.ApplyAppendEntries(in msg, nodes, profile);
 
             private static ClusterState EnqueueAppendResponse(ClusterState state, in InFlightMessage msg, TransitionScratch scratch, ExploreProfile profile, AppendOutcome applied)
             {
@@ -1766,9 +1778,6 @@ internal static class ExploreRunner
 
             private static bool IsStaleReadResponse(NodeState leader, in InFlightMessage msg) => leader.Role != NodeRole.Leader || leader.ReadIndex == 0 ||
                                                                                               msg.Term != leader.CurrentTerm || !msg.Success || msg.ReadIndex != leader.ReadIndex;
-
-            [Immutable]
-            private sealed record AppendOutcome(bool Success, int MatchIndex);
         }
     }
 
@@ -1779,7 +1788,6 @@ internal static class ExploreRunner
             var initial = ClusterState.CreateInitial(profile.ReplicaCount);
             var work = new SearchWork(profile, broken);
             var startFp = initial.Fingerprint(profile.SymmetryReduce);
-            _ = work.Seen.Add(startFp);
             work.Parents[startFp] = null;
             work.Queue.Enqueue(new QueuedState(initial, startFp));
 
@@ -1810,7 +1818,7 @@ internal static class ExploreRunner
         private static ExploreResult Search(SearchWork work)
         {
             var transitions = 0;
-            while (work.Queue.Count > 0 && work.Seen.Count < work.Profile.MaxStates)
+            while (work.Queue.Count > 0 && work.Parents.Count < work.Profile.MaxStates)
             {
                 var (current, currentFp) = work.Queue.Dequeue();
                 ModelTransitions.CollectSuccessors(current, work.Profile, work.Broken, work.Successors);
@@ -1825,7 +1833,7 @@ internal static class ExploreRunner
 
             var policyPath = work.FirstPolicyFingerprint == null ? null : ReconstructPath(work.Parents, work.FirstPolicyFingerprint);
             return new ExploreResult(
-                work.Seen.Count,
+                work.Parents.Count,
                 transitions,
                 new ViolationReport(null, null, work.FirstPolicy, work.FirstPolicyState),
                 work.Queue.Count == 0,
@@ -1835,22 +1843,21 @@ internal static class ExploreRunner
         private static ExploreResult? VisitSuccessor(SearchWork work, string currentFp, ClusterState next, int transitions)
         {
             var chars = next.FingerprintChars(work.Profile.SymmetryReduce);
-            if (work.Seen.GetAlternateLookup<ReadOnlySpan<char>>().Contains(chars))
+            if (work.Parents.GetAlternateLookup<ReadOnlySpan<char>>().ContainsKey(chars))
                 return null;
 
             var fp = chars.ToString();
-            _ = work.Seen.Add(fp);
             work.Parents[fp] = currentFp;
             var violation = SafetyChecker.Check(next);
             if (violation != null)
-                return new ExploreResult(work.Seen.Count, transitions, new ViolationReport(violation, next, null, null), false, ReconstructPath(work.Parents, fp));
+                return new ExploreResult(work.Parents.Count, transitions, new ViolationReport(violation, next, null, null), false, ReconstructPath(work.Parents, fp));
 
             // A step the protocol does not allow is recorded and the search continues: the state is still a state, so
             // stopping here would trade a fixed-point reading for a violation that says nothing about the data.
             work.RecordPolicy(next, fp);
 
-            if (work.Seen.Count >= work.Profile.MaxStates)
-                return new ExploreResult(work.Seen.Count, transitions, new ViolationReport(null, null, work.FirstPolicy, work.FirstPolicyState), false, null);
+            if (work.Parents.Count >= work.Profile.MaxStates)
+                return new ExploreResult(work.Parents.Count, transitions, new ViolationReport(null, null, work.FirstPolicy, work.FirstPolicyState), false, null);
 
             work.Queue.Enqueue(new QueuedState(next, fp));
             return null;
@@ -1867,7 +1874,6 @@ internal static class ExploreRunner
             {
                 Profile = profile;
                 Broken = broken;
-                Seen = [with(StringComparer.Ordinal)];
                 Parents = [with(StringComparer.Ordinal)];
                 Queue = new Queue<QueuedState>();
                 Successors = [with(64)];
@@ -1886,8 +1892,6 @@ internal static class ExploreRunner
             internal ExploreProfile Profile { get; }
 
             internal Queue<QueuedState> Queue { get; }
-
-            internal HashSet<string> Seen { get; }
 
             internal List<ClusterState> Successors { get; }
 
@@ -1908,29 +1912,6 @@ internal static class ExploreRunner
                 FirstPolicyFingerprint = fingerprint;
             }
         }
-    }
-
-    [Immutable]
-    private sealed class CommitProbe
-    {
-        internal CommitProbe(NodeState leader, IReadOnlyList<NodeState> nodes, int[] match, ExploreProfile profile, BrokenMode broken)
-        {
-            Leader = leader;
-            Nodes = nodes;
-            Match = match;
-            Profile = profile;
-            Broken = broken;
-        }
-
-        internal BrokenMode Broken { get; }
-
-        internal NodeState Leader { get; }
-
-        internal int[] Match { get; }
-
-        internal IReadOnlyList<NodeState> Nodes { get; }
-
-        internal ExploreProfile Profile { get; }
     }
 
     [Immutable]

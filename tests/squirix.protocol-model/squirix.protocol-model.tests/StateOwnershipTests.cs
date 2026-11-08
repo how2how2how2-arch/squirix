@@ -1,3 +1,5 @@
+using System;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using TUnit.Assertions;
 using TUnit.Assertions.Extensions;
@@ -34,7 +36,7 @@ public sealed class StateOwnershipTests
         _ = await Assert.That(state.MatchIndexes).IsNotSameReferenceAs(match);
     }
 
-    /// <summary>Unchanged collections stay shared, while replacement collections are copied even when they contain the same values.</summary>
+    /// <summary>Unchanged collections stay shared, while replacement collections remain isolated from callers.</summary>
     [Test]
     public async Task DerivedStatesShareOnlyOwnedArrays()
     {
@@ -62,6 +64,107 @@ public sealed class StateOwnershipTests
         _ = await Assert.That(lost.DiskLosses).IsEqualTo(state.DiskLosses + 1);
         _ = await Assert.That(lost.Messages).IsSameReferenceAs(state.Messages);
         _ = await Assert.That(lost.Partitions).IsSameReferenceAs(state.Partitions);
+    }
+
+    /// <summary>Equal replacements reuse owned arrays without retaining mutable caller arrays.</summary>
+    [Test]
+    public async Task EqualReplacementsReuseOwnedArrays()
+    {
+        var state = ClusterState.CreateInitial(3);
+        NodeState[] nodes = [state.Nodes[0], state.Nodes[1], state.Nodes[2]];
+        int[] partitions = [0, 0, 0];
+        int[] match = [0, 0, 0];
+        var derived = state.With(nodes, partitions: partitions, matchIndexes: match);
+        var before = state.Fingerprint(false);
+
+        _ = await Assert.That(derived.Nodes).IsSameReferenceAs(state.Nodes);
+        _ = await Assert.That(derived.Partitions).IsSameReferenceAs(state.Partitions);
+        _ = await Assert.That(derived.MatchIndexes).IsSameReferenceAs(state.MatchIndexes);
+
+        nodes[0] = nodes[0].Wiped();
+        partitions[0] = 9;
+        match[2] = 9;
+
+        _ = await Assert.That(derived.Fingerprint(false)).IsEqualTo(before);
+        _ = await Assert.That(state.Fingerprint(false)).IsEqualTo(before);
+    }
+
+    /// <summary>A difference at either end keeps the replacement values isolated from caller mutations.</summary>
+    /// <param name="index">The position of the differing element.</param>
+    [Test]
+    [Arguments(0)]
+    [Arguments(2)]
+    public async Task ChangedReplacementsRemainIsolated(int index)
+    {
+        var state = ClusterState.CreateInitial(3);
+        NodeState[] nodes = [state.Nodes[0], state.Nodes[1], state.Nodes[2]];
+        int[] partitions = [0, 0, 0];
+        int[] match = [0, 0, 0];
+        nodes[index] = nodes[index].Wiped();
+        partitions[index] = 1;
+        match[index] = 2;
+        var changed = state.With(nodes, partitions: partitions, matchIndexes: match);
+
+        _ = await Assert.That(changed.Nodes).IsNotSameReferenceAs(state.Nodes);
+        _ = await Assert.That(changed.Partitions).IsNotSameReferenceAs(state.Partitions);
+        _ = await Assert.That(changed.MatchIndexes).IsNotSameReferenceAs(state.MatchIndexes);
+
+        nodes[index] = state.Nodes[index];
+        partitions[index] = 0;
+        match[index] = 0;
+
+        _ = await Assert.That(changed.Nodes[index].Unseeded).IsTrue();
+        _ = await Assert.That(changed.Partitions[index]).IsEqualTo(1);
+        _ = await Assert.That(changed.MatchIndexes[index]).IsEqualTo(2);
+        _ = await Assert.That(state.Nodes[index].Unseeded).IsFalse();
+        _ = await Assert.That(state.Partitions[index]).IsEqualTo(0);
+        _ = await Assert.That(state.MatchIndexes[index]).IsEqualTo(0);
+    }
+
+    /// <summary>Restart keeps the owned durable log while replacing the node and clearing its volatile state.</summary>
+    /// <param name="hasLog">Whether the seeded node has persisted entries.</param>
+    /// <param name="unseeded">Whether the node is a copy that lost its disk.</param>
+    [Test]
+    [Arguments(false, false)]
+    [Arguments(true, false)]
+    [Arguments(false, true)]
+    public async Task CrashSharesLogAndResetsRuntime(bool hasLog, bool unseeded)
+    {
+        LogEntry[] log = hasLog ? [new(1, 1), new(2, 2)] : [];
+        var runtime = NodeRuntime.Initial;
+        if (!unseeded)
+        {
+            runtime = NodeRuntime.Create(log.Length, log.Length, 1, Math.Max(1, log.Length), 1, hasLog, true) with
+            {
+                KnownLeaderTerm = 2,
+                KnownLeaderId = 0,
+            };
+        }
+
+        var node = new NodeState(0, unseeded ? NodeRole.Follower : NodeRole.Leader, unseeded ? 0 : 2, unseeded ? -1 : 0, log, in runtime, unseeded);
+        var state = ClusterState.CreateInitial(1).WithNodesMatch([node], [log.Length + 1]);
+        var before = state.Fingerprint(false);
+        var reset = NodeRuntime.Create(node.CommitIndex, 0, 0, 0, 0, false);
+        var expectedNode = new NodeState(node.Id, NodeRole.Follower, node.CurrentTerm, node.VotedFor, node.LogEntries, in reset, node.Unseeded);
+        var expected = state.WithNodesMatch([expectedNode], [0]).Fingerprint(false);
+        var profile = ExploreProfile.ForReplicaCount(1, 3, 2, 2, 1, true, false);
+        ClusterState? restarted = null;
+        var matches = 0;
+        var successors = ExploreRunner.NextStates(state, profile, BrokenMode.None);
+        foreach (var next in CollectionsMarshal.AsSpan(successors))
+        {
+            if (!string.Equals(next.Fingerprint(false), expected, StringComparison.Ordinal))
+                continue;
+
+            matches++;
+            restarted = next;
+        }
+
+        _ = await Assert.That(matches).IsEqualTo(1);
+        _ = await Assert.That(restarted).IsNotNull();
+        _ = await Assert.That(restarted!.Nodes[0]).IsNotSameReferenceAs(node);
+        _ = await Assert.That(restarted.Nodes[0].LogEntries).IsSameReferenceAs(node.LogEntries);
+        _ = await Assert.That(state.Fingerprint(false)).IsEqualTo(before);
     }
 
     /// <summary>Metadata patches keep an owned log, while replacement and constructor input logs are isolated from callers.</summary>
